@@ -95,7 +95,9 @@ Notification types that do not mean "waiting on you" \(em
 quota auto-resume \(em are dropped. Titles read
 .IR "project \(bu agent @ machine" ,
 most-identifying part first, because a phone truncates a title to roughly one
-line and the project is the part worth keeping. Codex permits a single
+line and the project is the part worth keeping. A Codex turn whose whole answer is a JSON document is not forwarded: the
+ChatGPT desktop app runs background turns of its own that answer that way, and
+they are not worth an interruption. Codex permits a single
 .B notify
 program, so if one is already configured \(em the ChatGPT desktop app installs
 its own \(em rigor parks that command and replays it before pushing, and

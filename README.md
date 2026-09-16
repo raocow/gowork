@@ -104,6 +104,12 @@ question means the agent is stopped and waiting on you — as true after four
 seconds as after four minutes, and the one notification you least want dropped.
 Questions arrive at high priority with a `question` tag.
 
+Codex turns that answer with a JSON document rather than a sentence are not
+forwarded. The ChatGPT desktop app runs background turns of its own — an ambient
+pass over each project root that returns a suggestions document — and Codex
+fires its `notify` hook for those exactly as it does for yours, which otherwise
+put `{"suggestions":[]}` on your phone.
+
 **The topic name is the only thing protecting the feed on public ntfy.sh.** It
 lives in `~/.config/rigor/push.env`, mode 600, and `rigor push status` masks
 it unless you pass `--show`. Point `--server` at your own ntfy if you would
