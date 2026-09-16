@@ -92,10 +92,17 @@ and get the width back:
 ```bash
 rigor push setup --device ''      # titles become: myrepo · Claude
 ```
- Claude Code notifies when a turn ends **and** whenever it is blocked
-waiting on you; Codex notifies when a turn ends. Turns shorter than 60 seconds
-stay quiet, on the theory that you had not walked away yet
-(`RIGOR_PUSH_MIN_SECONDS` in `~/.config/rigor/push.env`).
+
+Claude Code notifies when a turn ends **and** whenever it is blocked waiting on
+you; Codex notifies when a turn ends. Turns shorter than 60 seconds stay quiet,
+on the theory that you had not walked away yet (`RIGOR_PUSH_MIN_SECONDS` in
+`~/.config/rigor/push.env`).
+
+**A turn that ends in a question always notifies, however fast it was.** The
+quiet-under threshold exists to skip turns you never walked away from, but a
+question means the agent is stopped and waiting on you — as true after four
+seconds as after four minutes, and the one notification you least want dropped.
+Questions arrive at high priority with a `question` tag.
 
 **The topic name is the only thing protecting the feed on public ntfy.sh.** It
 lives in `~/.config/rigor/push.env`, mode 600, and `rigor push status` masks

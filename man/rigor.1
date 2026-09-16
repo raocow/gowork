@@ -86,7 +86,13 @@ back up every file they edit
 and are safe to re-run. Claude Code notifies at the end of a turn and whenever
 it is blocked on you; Codex notifies at the end of a turn. Turns shorter than
 .B RIGOR_PUSH_MIN_SECONDS
-stay quiet. Titles read
+stay quiet, except that a turn ending in a question always notifies, at high
+priority \(em the threshold exists to skip turns you never walked away from, and
+a question means the agent is stopped and waiting however fast it got there.
+Notification types that do not mean "waiting on you" \(em
+.BR auth_success ,
+.BR agent_completed ,
+quota auto-resume \(em are dropped. Titles read
 .IR "project \(bu agent @ machine" ,
 most-identifying part first, because a phone truncates a title to roughly one
 line and the project is the part worth keeping. Codex permits a single
