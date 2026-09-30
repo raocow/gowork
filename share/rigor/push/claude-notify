@@ -4,16 +4,32 @@
 set -uo pipefail
 HERE="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 input="$(cat)"
-# IFS is the tab alone: the perl call below emits tab-separated fields, and
-# the default IFS would also split them on spaces, truncating any value that
-# contains one — a project path very often does.
-IFS=$'\t' read -r msg cwd <<<"$(printf '%s' "$input" | /usr/bin/perl -MJSON::PP -e '
+# The delimiter is US (0x1f), not a tab. Tab is an IFS *whitespace* character,
+# so bash collapses runs of it and drops leading ones: an empty field makes
+# every later field shift left by one. US is not IFS whitespace, so empty
+# fields survive exactly where they are. A plain space is worse still — it
+# splits any value containing one, and project paths often do.
+IFS=$'\x1f' read -r ntype msg cwd <<<"$(printf '%s' "$input" | /usr/bin/perl -MJSON::PP -e '
   local $/; my $d = eval { decode_json(<STDIN>) } || {};
   binmode(STDOUT, ":utf8");
   my $m = $d->{message} // "Claude Code needs you.";
-  $m =~ s/[\t\r\n]+/ /g;
-  printf "%s\t%s", $m, $d->{cwd} // "";' 2>/dev/null)"
+  $m =~ s/[\t\r\n\x1f]+/ /g;
+  printf "%s\x1f%s\x1f%s", $d->{notification_type} // "", $m, $d->{cwd} // "";' 2>/dev/null)"
 [ -n "${msg:-}" ] || msg="Claude Code needs you."
+
+# Claude Code raises this event for more than "Claude needs you": successful
+# auth, a finished agent, quota auto-resume. None of those are worth pulling
+# you out of a meeting, so they are dropped.
+#
+# Dropped here rather than by a `matcher` in settings.json on purpose. A matcher
+# is an allow-list, and the day Claude Code adds or renames a blocking type, an
+# allow-list goes quiet and gives you no way to notice. This deny-list fails
+# open: a type nobody has heard of still reaches your phone.
+case "${ntype:-}" in
+  auth_success|agent_completed|elicitation_complete|elicitation_response|quota_auto_resume_*)
+    exit 0 ;;
+esac
+
 label="Claude"
 [ -n "${cwd:-}" ] && label="$(basename "$cwd") · Claude"
 "$HERE/send" "$label" "$msg" high bell || true

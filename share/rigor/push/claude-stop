@@ -1,50 +1,84 @@
 #!/usr/bin/env bash
-# Claude Code Stop hook — push the closing message, but only for a turn long
-# enough that you probably walked away from it.
+# Claude Code Stop hook — push the closing message when the turn ran long
+# enough that you probably walked away, and always when it ended in a question.
 set -uo pipefail
 HERE="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/common.sh"
 push_load || exit 0
 
-input="$(cat)"
-# IFS is the tab alone: the perl call below emits tab-separated fields, and
-# the default IFS would also split them on spaces, truncating any value that
-# contains one — a project path very often does.
-IFS=$'\t' read -r sid cwd transcript <<<"$(printf '%s' "$input" | /usr/bin/perl -MJSON::PP -e '
+# One perl call: the three single-line fields tab-separated on the first line,
+# then the closing message, which is multi-line and cannot share a line with
+# anything. Stop hooks are given last_assistant_message outright, so the
+# transcript is only opened when that field is missing.
+parsed="$(cat | /usr/bin/perl -MJSON::PP -e '
   local $/; my $d = eval { decode_json(<STDIN>) } || {};
-  # Tab-separated: these three never contain a tab in practice, and it keeps
-  # the hook to a single perl call.
-  printf "%s\t%s\t%s", $d->{session_id} // "unknown",
-                       $d->{cwd} // "", $d->{transcript_path} // "";' 2>/dev/null)"
+  binmode(STDOUT, ":utf8");
+  printf "%s\x1f%s\x1f%s\n%s", $d->{session_id} // "unknown", $d->{cwd} // "",
+                           $d->{transcript_path} // "",
+                           $d->{last_assistant_message} // "";' 2>/dev/null)"
+
+# The delimiter is US (0x1f), not a tab. Tab is an IFS *whitespace* character,
+# so bash collapses runs of it and drops leading ones: an empty field makes
+# every later field shift left by one. US is not IFS whitespace, so empty
+# fields survive exactly where they are. A plain space is worse still — it
+# splits any value containing one, and project paths often do.
+IFS=$'\x1f' read -r sid cwd transcript <<<"$(printf '%s' "$parsed" | head -1)"
+msg="$(printf '%s' "$parsed" | tail -n +2)"
 [ -n "${sid:-}" ] || sid=unknown
 
 dir="${TMPDIR:-/tmp}/rigor-push"
 start="$(cat "$dir/$sid" 2>/dev/null || echo 0)"
 rm -f "$dir/$sid" 2>/dev/null || true
 case "$start" in ''|*[!0-9]*) start=0 ;; esac
-if [ "$start" -gt 0 ] && [ "$(( $(date +%s) - start ))" -lt "$RIGOR_PUSH_MIN_SECONDS" ]; then
-  exit 0
-fi
 
-msg=""
-if [ -n "${transcript:-}" ] && [ -r "$transcript" ]; then
-  # Last text block of the last assistant entry. Tail-limited so a long
-  # transcript does not turn every Stop into a full-file parse.
-  msg="$(tail -n 60 "$transcript" 2>/dev/null | /usr/bin/perl -MJSON::PP -ne '
-    my $d = eval { decode_json($_) } or next;
-    next unless ($d->{type} // "") eq "assistant";
-    my $c = $d->{message}{content};
-    next unless ref $c eq "ARRAY";
-    for my $b (@$c) {
-      $last = $b->{text} if ref $b eq "HASH" && ($b->{type} // "") eq "text";
+# Fallback for a Claude Code that does not supply last_assistant_message: the
+# last non-empty text block, searched backwards so an entry that is only tool
+# calls does not blank the message out. Tail-limited, so a long transcript does
+# not turn every Stop into a full-file parse.
+if [ -z "$msg" ] && [ -n "${transcript:-}" ] && [ -r "$transcript" ]; then
+  msg="$(tail -n 60 "$transcript" 2>/dev/null | /usr/bin/perl -MJSON::PP -e '
+    my @a;
+    while (my $l = <STDIN>) {
+      my $d = eval { decode_json($l) } or next;
+      push @a, $d if ($d->{type} // "") eq "assistant";
     }
-    END { binmode(STDOUT, ":utf8"); print $last // "" }' 2>/dev/null)"
+    my $text = "";
+    for my $d (reverse @a) {
+      my $c = $d->{message}{content};
+      next unless ref $c eq "ARRAY";
+      for my $b (reverse @$c) {
+        next unless ref $b eq "HASH" && ($b->{type} // "") eq "text";
+        if (length($b->{text} // "")) { $text = $b->{text}; last }
+      }
+      last if length $text;
+    }
+    binmode(STDOUT, ":utf8"); print $text;' 2>/dev/null)"
 fi
 [ -n "$msg" ] || msg="Turn finished."
+
+# A turn that ends on a question is blocked on you, and it is blocked whether it
+# took four minutes or four seconds — so the quiet-under threshold, which exists
+# to suppress turns you never walked away from, must not apply to one. This is
+# the single most useful notification the hook sends: without it, a quick
+# clarifying question is exactly the case that stays silent.
+trimmed="${msg%"${msg##*[![:space:]]}"}"
+asked=0
+[ "${trimmed%\?}" != "$trimmed" ] && asked=1
+
+if [ "$asked" = 0 ] \
+   && [ "$start" -gt 0 ] \
+   && [ "$(( $(date +%s) - start ))" -lt "$RIGOR_PUSH_MIN_SECONDS" ]; then
+  exit 0
+fi
 
 # Project first: it is the part that tells you which task finished, so it has
 # to survive the phone's truncation. The agent name follows, the device after.
 label="Claude"
 [ -n "${cwd:-}" ] && label="$(basename "$cwd") · Claude"
-"$HERE/send" "$label" "$msg" default white_check_mark || true
+
+if [ "$asked" = 1 ]; then
+  "$HERE/send" "$label" "$msg" high question || true
+else
+  "$HERE/send" "$label" "$msg" default white_check_mark || true
+fi
 exit 0
