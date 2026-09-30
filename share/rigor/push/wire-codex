@@ -28,6 +28,27 @@ for my $i (0 .. $#lines) {
 }
 
 my $report = '';
+
+# The ChatGPT desktop app has learned to chain rather than clobber: it takes the
+# notify slot for its own client and passes whatever was there before along as
+# --previous-notify. When it has done that, the array mentions this wrapper but
+# is not only this wrapper, and the right move is to touch nothing. The app is
+# already doing the preserving that the parked argv exists to do, so replaying
+# our copy on top would run its client a second time every turn; and rewriting
+# the array to the wrapper alone would throw away the chaining it set up, which
+# it would quietly restore behind us anyway.
+my $chained = defined $existing
+           && index($existing, $wrapper) >= 0
+           && $existing ne $json->encode([$wrapper]);
+if ($mode eq 'on' && $chained) {
+  # Drop the parked argv: it holds the app's own client, which the app now
+  # invokes itself.
+  open my $p, '>', $pass or die "wire-codex: cannot write $pass: $!\n";
+  close $p;
+  print "the ChatGPT app already chains to us, left alone\n";
+  exit 0;
+}
+
 if ($mode eq 'on') {
   # Park the previous notifier's argv, unless the slot is already ours — that
   # check is the whole point. Capturing our own wrapper as its own parent would

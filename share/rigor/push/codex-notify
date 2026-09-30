@@ -20,12 +20,41 @@ if [ -s "$PASS" ]; then
   fi
 fi
 
-msg="$(printf '%s' "${*: -1}" | /usr/bin/perl -MJSON::PP -e '
+# First line is a flag, the rest is the message, which is multi-line and so
+# cannot share a line with anything else.
+parsed="$(printf '%s' "${*: -1}" | /usr/bin/perl -MJSON::PP -e '
   local $/; my $d = eval { decode_json(<STDIN>) } || {};
   binmode(STDOUT, ":utf8");
-  print $d->{"last-assistant-message"} // $d->{last_assistant_message}
-        // $d->{message} // "";' 2>/dev/null || true)"
+  my $m = $d->{"last-assistant-message"} // $d->{last_assistant_message}
+          // $d->{message} // "";
+  # Is the whole answer a JSON document rather than a sentence? Checked by
+  # actually parsing it, not by the first character: plenty of real answers
+  # open with a markdown link, which starts "[" and is not JSON.
+  my $j = 0;
+  if ($m =~ /^\s*[\{\[]/) { $j = 1 if defined eval { decode_json($m) } }
+  print $j ? "J" : "-", "\n", $m;' 2>/dev/null || true)"
+flag="$(printf '%s' "$parsed" | head -1)"
+msg="$(printf '%s' "$parsed" | tail -n +2)"
+
+# The ChatGPT desktop app runs turns of its own — an ambient pass over each
+# project root that returns a suggestions document — and Codex fires notify for
+# those exactly as it does for yours. Their answer is a JSON document, so the
+# phone was getting {"suggestions":[]} and similar. A notification body is prose
+# for a person; a machine-readable document is not worth an interruption.
+#
+# The replay above still happens, deliberately: skipping our own push must not
+# also silence the desktop notifier we are standing in front of.
+[ "$flag" = "J" ] && exit 0
+
 [ -n "$msg" ] || msg="Turn ended."
 
-"$HERE/send" "$(basename "$PWD") · Codex" "$msg" default robot || true
+# Those same background turns run from / rather than a repo, and "/ · Codex"
+# tells you nothing. Fall back to the bare agent name.
+proj="$(basename "$PWD" 2>/dev/null || true)"
+case "$proj" in
+  ''|'/'|'.') label="Codex" ;;
+  *)          label="$proj · Codex" ;;
+esac
+
+"$HERE/send" "$label" "$msg" default robot || true
 exit 0
