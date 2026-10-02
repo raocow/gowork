@@ -71,13 +71,17 @@ EOF
 
 # Stable share dir for lines written into the rc file: prefer the version-independent
 # Homebrew opt path; fall back to the resolved location for source/dev runs.
+# gowork is this script's formula now; rigor is the formula it used to ship
+# in, still honored so a machine mid-upgrade keeps working.
 share_dir() {
-  local p
-  if p="$(brew --prefix rigor 2>/dev/null)" && [ -d "$p/share/rigor" ]; then
-    echo "$p/share/rigor"
-  else
-    echo "$SHARE"
-  fi
+  local p f
+  for f in gowork rigor; do
+    if p="$(brew --prefix "$f" 2>/dev/null)" && [ -d "$p/share/rigor" ] \
+       && [ "$(cd -P "$p/share/rigor" && pwd)" = "$(cd -P "$SHARE" && pwd)" ]; then
+      echo "$p/share/rigor"; return
+    fi
+  done
+  echo "$SHARE"
 }
 
 feature_file() {
@@ -92,6 +96,7 @@ feature_file() {
 # Echo the requested features, expanding 'all', defaulting to all when empty,
 # and normalizing legacy names ('py-fallback' -> 'pyf') to their canonical form.
 # 'ghswitch' used to live here too; it moved to gitplus with the account
+# (and was later retired in favour of the gh shim, `rigor identity`)
 # registry it depends on, and is sourced from there instead of being enabled
 # by name.
 expand_features() {
@@ -287,19 +292,19 @@ cmd_status() {
     fi
   done
   # Per-directory git/ssh/GitHub accounts used to live here as `devrig
-  # account`. They moved to gitplus as `gp account`, because every gp-*
+  # account`. They moved to gitplus as `gw account`, because every gp-*
   # command needs to resolve the bound account before calling gh — so the
   # registry belongs with the git tooling, not a shell-helper package.
-  # Existing config keeps working: `gp account` reads the sentinels this
+  # Existing config keeps working: `gw account` reads the sentinels this
   # wrote. Mentioned here rather than dropped silently, since `rigor status`
   # used to list accounts and someone will wonder where they went.
   if command -v gp-account >/dev/null 2>&1 && [ -n "$(gp-account list 2>/dev/null | head -1)" ]; then
-    echo "accounts: moved to gitplus — see 'gp account list'"
+    echo "accounts: moved to gitplus — see 'gw account list'"
   fi
   # push is not an rc feature, so it has no line above. Reported anyway: it
   # changes what your phone does, and `rigor status` is where you look.
   if [ -f "$PUSH_CLAUDE" ] && grep -q 'rigor/push/claude-' "$PUSH_CLAUDE" 2>/dev/null; then
-    echo "  push : wired — see 'rigor push status'"
+    echo "  push : wired — see 'gw notify status'"
   fi
 }
 
@@ -399,7 +404,7 @@ _push_setup() {
       # rather than read as "no --device given".
       --device) device="${2:-}"; device_set=1; shift 2 ;;
       --server) server="${2:-}"; shift 2 ;;
-      *) echo "rigor push setup: unknown option '$1'" >&2; return 2 ;;
+      *) echo "gw notify setup: unknown option '$1'" >&2; return 2 ;;
     esac
   done
 
@@ -426,7 +431,7 @@ _push_setup() {
   local cw; cw="$(_push_conf_write)"
   mkdir -p "$(dirname "$cw")"
   cat > "$cw" <<CONF
-# rigor push — written by 'rigor push setup'. Keep this file private:
+# rigor push — written by 'gw notify setup'. Keep this file private:
 # on public ntfy.sh the topic name is the only thing protecting the feed.
 NTFY_SERVER="$NTFY_SERVER"
 NTFY_TOPIC="$NTFY_TOPIC"
@@ -472,9 +477,9 @@ CONF
   echo
   echo "Subscribe your phone to topic '$NTFY_TOPIC' at $NTFY_SERVER (ntfy app)."
   if [ "$fresh" = 1 ]; then
-    echo "On your other machines:  rigor push setup --topic $NTFY_TOPIC"
+    echo "On your other machines:  gw notify setup --topic $NTFY_TOPIC"
   fi
-  echo "Then check it end to end:  rigor push test"
+  echo "Then check it end to end:  gw notify test"
 }
 
 _push_status() {
@@ -483,7 +488,7 @@ _push_status() {
   _push_load
   local c; c="$(_push_conf_read)"
   if [ ! -r "$c" ] || [ -z "${NTFY_TOPIC:-}" ]; then
-    echo "not set up — run: rigor push setup"
+    echo "not set up — run: gw notify setup"
     return 0
   fi
   echo "config    : ${c/#$HOME/~}"
@@ -529,10 +534,10 @@ _push_status() {
 _push_test() {
   _push_load
   if [ -z "${NTFY_TOPIC:-}" ]; then
-    echo "not set up — run: rigor push setup" >&2
+    echo "not set up — run: gw notify setup" >&2
     return 1
   fi
-  local msg="${*:-rigor push test}"
+  local msg="${*:-gw notify test}"
   "$(push_dir)/send" "rigor" "$msg" default bell
   sleep 2
   if curl -fsS --max-time 15 "${NTFY_SERVER%/}/${NTFY_TOPIC}/json?poll=1&since=1m" 2>/dev/null \
@@ -572,13 +577,13 @@ cmd_push() {
     off)    _push_off ;;
     *)
       cat >&2 <<'EOF'
-rigor push: specify a subcommand
+gw notify: specify a subcommand
 
-  rigor push setup [--topic T] [--device NAME] [--server URL]
+  gw notify setup [--topic T] [--device NAME] [--server URL]
       --device '' leaves this machine out of the notification titles
-  rigor push status [--show]
-  rigor push test [message]
-  rigor push off
+  gw notify status [--show]
+  gw notify test [message]
+  gw notify off
 
 Notifies your phone when a Claude Code or Codex turn ends, via ntfy.
 EOF
@@ -727,7 +732,7 @@ _ident_setup() {
     mkdir -p "$(dirname "$IDENT_MAP")"
     cat >"$IDENT_MAP" <<'EOF'
 # <dir-glob> <aws profile> — read by rigor's aws shim. First match wins, so
-# specific directories go above their parents; `rigor identity bind` keeps
+# specific directories go above their parents; `gw aws bind` keeps
 # that order. A directory matches itself and everything below it.
 EOF
     echo "aws map   : created ${IDENT_MAP/#$HOME/~}"
@@ -739,17 +744,17 @@ EOF
   if command -v gp-account >/dev/null 2>&1; then
     echo
     if [ -t 0 ] && [ -t 1 ]; then
-      echo "Checking each account's ssh key with GitHub (gp account check --fix):"
+      echo "Checking each account's ssh key with GitHub (gw account check --fix):"
       gp-account check --fix || true
     else
-      echo "ssh keys  : not checked (no terminal) — run: gp account check --fix"
+      echo "ssh keys  : not checked (no terminal) — run: gw account check --fix"
     fi
   fi
 
   echo
-  echo "Bind directories:  rigor identity bind <aws-profile> [dir]"
-  echo "                   gp account bind <name> <dir>     (gh, via gitplus)"
-  echo "Then open a new shell (and restart agent apps) and check: rigor identity status"
+  echo "Bind directories:  gw aws bind <aws-profile> [dir]"
+  echo "                   gw account bind <name> <dir>"
+  echo "Then open a new shell (and restart agent apps) and check: gw account status"
 }
 
 _ident_resolve() {  # <gh|aws> — what the shim would use in $PWD
@@ -763,7 +768,7 @@ _ident_status() {
   if [ -x "$IDENT_BIN/gh" ] && [ -x "$IDENT_BIN/aws" ]; then
     echo "shims     : ${IDENT_BIN/#$HOME/~}"
   else
-    echo "not set up — run: rigor identity setup"
+    echo "not set up — run: gw account setup"
     return 0
   fi
   for t in gh aws; do
@@ -777,7 +782,7 @@ _ident_status() {
   if git config --global --get-regexp '^credential\..*\.helper$' 2>/dev/null | grep -qF "$IDENT_BIN/gh"; then
     echo "git       : credential helper via shim"
   elif git config --global --get-regexp '^credential\..*\.helper$' 2>/dev/null | grep -qF 'gh auth git-credential'; then
-    echo "git       : credential helper bypasses the shim — run: rigor identity setup"
+    echo "git       : credential helper bypasses the shim — run: gw account setup"
   fi
   if [ -f "$IDENT_CLAUDE" ]; then
     echo "claude    : $("$(_ident_src)/wire-claude" status "$IDENT_CLAUDE" 2>&1)"
@@ -788,7 +793,7 @@ _ident_status() {
   case "$r" in
     env) echo "  gh      : GH_TOKEN/GITHUB_TOKEN from the environment (wins over bindings)" ;;
     "")  if command -v gp-account >/dev/null 2>&1; then
-           echo "  gh      : unbound — gh's active account (bind: gp account bind <name> <dir>)"
+           echo "  gh      : unbound — gh's active account (bind: gw account bind <name> <dir>)"
          else
            echo "  gh      : gitplus not installed — gh's active account"
          fi ;;
@@ -797,7 +802,7 @@ _ident_status() {
   r="$(_ident_resolve aws)"
   case "$r" in
     env) echo "  aws     : AWS_PROFILE/AWS_ACCESS_KEY_ID from the environment (wins over bindings)" ;;
-    "")  echo "  aws     : unbound — [default] (bind: rigor identity bind <profile>)" ;;
+    "")  echo "  aws     : unbound — [default] (bind: gw aws bind <profile>)" ;;
     *)   echo "  aws     : $r" ;;
   esac
 
@@ -810,7 +815,7 @@ _ident_status() {
 _ident_bind() {
   local prof="${1:-}" dir="${2:-$PWD}"
   if [ -z "$prof" ]; then
-    echo "usage: rigor identity bind <aws-profile> [dir]" >&2
+    echo "usage: gw aws bind <aws-profile> [dir]" >&2
     return 2
   fi
   dir="$(cd "$dir" 2>/dev/null && pwd)" || { echo "rigor identity: no such directory: ${2:-}" >&2; return 1; }
@@ -893,15 +898,15 @@ cmd_identity() {
     off)    _ident_off ;;
     *)
       cat >&2 <<'EOF'
-rigor identity: specify a subcommand
+gw account: specify a subcommand
 
-  rigor identity setup                    Install gh/aws shims and put them on PATH
-  rigor identity status                   What's wired, and what applies here
-  rigor identity bind <aws-profile> [dir] Use that AWS profile in dir and below
-  rigor identity unbind [dir]
-  rigor identity off                      Unwire, restoring what was there before
+  gw account setup               Install gh/aws shims and put them on PATH
+  gw account status              What's wired, and what applies here
+  gw account off                 Unwire, restoring what was there before
+  gw aws bind <profile> [dir]    Use that AWS profile in dir and below
+  gw aws unbind [dir]
 
-gh accounts are bound with gitplus: gp account bind <name> <dir>.
+GitHub accounts are bound with: gw account bind <name> <dir>.
 EOF
       return 1 ;;
   esac
@@ -929,7 +934,7 @@ case "${1:-help}" in
   # usage dump. Forwards the arguments so the suggestion is runnable as-is.
   account|accounts)
     shift
-    echo "rigor: accounts moved to gitplus — run: gp account${*:+ $*}" >&2
+    echo "rigor: accounts moved to gitplus — run: gw account${*:+ $*}" >&2
     echo "  (your existing accounts and bindings still work there, unchanged)" >&2
     exit 1 ;;
   sleep)                shift; cmd_sleep "$@" ;;

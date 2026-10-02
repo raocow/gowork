@@ -1,0 +1,89 @@
+#compdef gowork gw
+
+# The git and pull-request commands reuse gp's per-command completions
+# (_gp-<cmd>); identity and shell groups complete their subcommands; anything
+# else falls through to git's own completion, the same way the command does.
+local curcontext="$curcontext" line state
+
+_arguments -C \
+  '1: :->cmd' \
+  '*::arg:->args'
+
+case $state in
+  cmd)
+    local -a commands=(
+      'pr:GitHub pull requests'
+      'pl:shorthand for pr list'
+      'pm:shorthand for pr merge'
+      'new:create a branch'
+      'switch:git switch, plus worktree/PR resolution'
+      'sync:rebase branches onto base'
+      'done:finish current branch'
+      'sweep:delete merged branches'
+      'wsweep:delete stale worktrees'
+      'haspr:check for open PR'
+      'release:tag and release'
+      'account:per-directory GitHub accounts, keys, shims'
+      'aws:per-directory AWS profiles'
+      'shell:shell features (autovenv, pyf, envup)'
+      'notify:phone notifications for agent turns'
+      'sleep:keep the Mac awake'
+      'migrate:move a rigor/gitplus setup to gowork'
+      'help:show help'
+      'version:print version'
+    )
+    _describe 'gowork command' commands
+    ;;
+  args)
+    local sub=$line[1]
+    case $sub in
+      account)
+        if (( CURRENT == 2 )); then
+          local -a subs=(
+            'setup:install gh/aws shims, routing, sandbox wiring'
+            'status:what applies in this directory'
+            'off:unwire setup'
+            'add:register an account'
+            'bind:use an account in a directory'
+            'unbind:drop a binding'
+            'sweep:trace and clean up dead bindings'
+            'list:accounts and bindings'
+            'key:print an account public key'
+            'register:get the SSH key accepted by GitHub'
+            'check:verify accounts, keys and bindings'
+          )
+          _describe 'account command' subs
+        else
+          _files -/
+        fi ;;
+      aws)
+        if (( CURRENT == 2 )); then
+          local -a subs=('bind:AWS profile for a directory' 'unbind:drop it' 'status:what applies here')
+          _describe 'aws command' subs
+        else
+          _files -/
+        fi ;;
+      shell)
+        if (( CURRENT == 2 )); then
+          local -a subs=(enable disable status doctor init)
+          _describe 'shell command' subs
+        else
+          local -a feats=(autovenv pyf envup all)
+          _describe 'feature' feats
+        fi ;;
+      notify)
+        (( CURRENT == 2 )) && { local -a subs=(setup status test off); _describe 'notify command' subs; } ;;
+      sleep)
+        (( CURRENT == 2 )) && { local -a subs=(on off status); _describe 'sleep command' subs; } ;;
+      *)
+        if (( $+functions[_gp-$sub] )); then
+          _gp-$sub
+        else
+          # Plain git: hand the words to git's completion as if typed after `git`.
+          words=(git "${words[@]}")
+          (( CURRENT++ ))
+          _normal
+        fi ;;
+    esac
+    ;;
+esac

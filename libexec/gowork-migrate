@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# gw migrate [--dry-run] — point an existing rigor/gitplus setup at gowork.
+#
+# rigor and gitplus wrote paths to their own install into your config: source
+# lines and a completion path in shell rc files, hook commands in Claude
+# Code's settings, Codex's notify program, the identity shims. Those paths
+# stop existing once the old formulas (or checkouts) go, and everything they
+# drive quietly turns off. This rewrites each of them to the same file under
+# gowork, and drops the gitplus ghswitch hook, which the gh shim replaces.
+#
+# Only the install's location changes: config under ~/.config/rigor, the
+# `# rigor:` rc markers and the RIGOR_* variables are gowork's own names too,
+# so nothing else needs to move. Every edited file is backed up beside itself
+# (.gowork-bak) and the edit is shown as a diff; --dry-run shows it without
+# writing.
+set -eo pipefail
+
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+ROOT="$(cd -P "$(dirname "$_src")/.." && pwd)"
+
+dry=""
+case "${1:-}" in
+  --dry-run|-n) dry=1 ;;
+  "") ;;
+  *) echo "usage: gw migrate [--dry-run]" >&2; exit 2 ;;
+esac
+
+# Where gowork should be referenced from: Homebrew's version-independent opt
+# path when installed by brew (a Cellar path would break on every upgrade),
+# otherwise this checkout.
+NEW="$ROOT"
+if opt="$(brew --prefix gowork 2>/dev/null)" && [ -d "$opt" ] \
+   && [ "$(cd -P "$opt" && pwd)" = "$ROOT" ]; then
+  NEW="$opt"
+fi
+
+ZDIR="${ZDOTDIR:-$HOME}"
+RC_FILES=("$ZDIR/.zshrc" "$ZDIR/.zshenv" "$ZDIR/.zprofile")
+CLAUDE="${RIGOR_PUSH_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
+CODEX="${RIGOR_PUSH_CODEX_CONF:-$HOME/.codex/config.toml}"
+IDENT_BIN="${RIGOR_IDENTITY_BIN:-$HOME/.local/share/rigor/identity/bin}"
+LOCAL_BIN="${GOWORK_LOCAL_BIN:-$HOME/.local/bin}"
+
+changed=0
+note() { echo "$*"; }
+
+# rewrite <file> — print the migrated content of <file> on stdout. A path
+# counts as an old install when it ends in a rigor/gitplus install root
+# (Homebrew opt or Cellar path, or a checkout named rigor, gitplus, devrig or
+# ezenv) followed by /share/rigor/ or /share/zsh/. Kept in the form it was
+# written in: "$HOME/…" stays "$HOME/…", "~/…" stays "~/…".
+rewrite() {
+  NEW="$NEW" HOME="$HOME" perl -ne '
+    my $new = $ENV{NEW}; my $home = $ENV{HOME};
+    # The ghswitch hook is gone; the gh shim does its job for every process.
+    next if m{share/zsh/ghswitch\.zsh};
+    s{((?:\$\{?HOME\}?|~)?(?:/[^\s"'"'"'\\;]*?)?/(?:opt/(?:rigor|gitplus)|Cellar/(?:rigor|gitplus)/[^/\s"'"'"'\\]+|rigor|gitplus|devrig|ezenv))/share/(rigor|zsh)/}{
+      my ($old, $kind) = ($1, $2);
+      my $repl = $new;
+      if ($old =~ /^\$\{?HOME\}?/ && index($new, "$home/") == 0) { $repl = q{$HOME} . substr($new, length $home) }
+      elsif ($old =~ /^~/ && index($new, "$home/") == 0)          { $repl = "~" . substr($new, length $home) }
+      "$repl/share/$kind/"
+    }ge;
+    print;
+  ' "$1"
+}
+
+# apply <file> <new-content-file> [json] — show the diff, back up, write.
+apply() {
+  local f="$1" tmp="$2" kind="${3:-}"
+  if cmp -s "$f" "$tmp"; then rm -f "$tmp"; return 0; fi
+  if [ "$kind" = json ] && ! perl -MJSON::PP -e 'local $/; JSON::PP->new->decode(<STDIN>)' <"$tmp" 2>/dev/null; then
+    note "skip   : ${f/#$HOME/~} — the rewrite didn't parse as JSON, left untouched"
+    rm -f "$tmp"; return 0
+  fi
+  echo "--- ${f/#$HOME/~}"
+  diff "$f" "$tmp" | sed -n 's/^</  -/p;s/^>/  +/p' || true
+  if [ -z "$dry" ]; then
+    cp "$f" "$f.gowork-bak"
+    cat "$tmp" > "$f"     # in place, so a symlinked dotfile stays a symlink
+  fi
+  rm -f "$tmp"
+  changed=$((changed + 1))
+}
+
+for f in "${RC_FILES[@]}" "$CLAUDE" "$CODEX"; do
+  [ -f "$f" ] || continue
+  tmp="$(mktemp "$f.gowork.XXXXXX")"
+  rewrite "$f" > "$tmp"
+  case "$f" in *.json) apply "$f" "$tmp" json ;; *) apply "$f" "$tmp" ;; esac
+done
+
+# Identity shims: symlinks into an old install's share/rigor/identity.
+if [ -d "$IDENT_BIN" ]; then
+  for t in gh aws; do
+    l="$IDENT_BIN/$t"
+    [ -L "$l" ] || continue
+    want="$NEW/share/rigor/identity/$t"
+    cur="$(readlink "$l")"
+    [ "$cur" = "$want" ] && continue
+    echo "--- ${l/#$HOME/~}"
+    echo "  -> $cur"
+    echo "  -> $want"
+    [ -z "$dry" ] && ln -sfn "$want" "$l"
+    changed=$((changed + 1))
+  done
+fi
+
+# Command links from a checkout install (install.sh, or links made by hand):
+# ~/.local/bin/<cmd> -> <old checkout>/bin/<cmd>. Repointed only when gowork
+# runs from a checkout itself; a Homebrew install puts its own on PATH.
+if [ "$NEW" = "$ROOT" ] && [ -d "$LOCAL_BIN" ]; then
+  relinked=0
+  for l in "$LOCAL_BIN"/*; do
+    [ -L "$l" ] || continue
+    cur="$(readlink "$l")"
+    name="$(basename "$l")"
+    case "$cur" in
+      */rigor/bin/*|*/gitplus/bin/*|*/devrig/bin/*) ;;
+      *) continue ;;
+    esac
+    [ -e "$ROOT/bin/$name" ] || continue
+    [ "$cur" = "$ROOT/bin/$name" ] && continue
+    echo "--- ${l/#$HOME/~}"
+    echo "  -> $cur"
+    echo "  -> $ROOT/bin/$name"
+    [ -z "$dry" ] && ln -sfn "$ROOT/bin/$name" "$l"
+    relinked=1; changed=$((changed + 1))
+  done
+  if [ "$relinked" = 1 ]; then
+    for name in gowork gw; do
+      [ -e "$LOCAL_BIN/$name" ] && continue
+      echo "--- ${LOCAL_BIN/#$HOME/~}/$name"
+      echo "  + -> $ROOT/bin/$name"
+      [ -z "$dry" ] && ln -s "$ROOT/bin/$name" "$LOCAL_BIN/$name"
+      changed=$((changed + 1))
+    done
+  fi
+fi
+
+echo ""
+if [ "$changed" -eq 0 ]; then
+  echo "nothing refers to an old rigor/gitplus install — already migrated."
+elif [ -n "$dry" ]; then
+  echo "$changed change(s) above; nothing written. Run without --dry-run to apply."
+else
+  echo "$changed change(s) made; edited files are backed up as <file>.gowork-bak."
+  echo "Open a new shell (and restart agent apps) to pick them up."
+  if brew list --formula 2>/dev/null | grep -qxE 'rigor|gitplus'; then
+    echo "Then remove the old formulas: brew uninstall rigor gitplus"
+  fi
+fi

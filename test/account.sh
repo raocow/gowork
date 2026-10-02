@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end test for `gp account`, run entirely inside a throwaway $HOME.
+# End-to-end test for `gw account`, run entirely inside a throwaway $HOME.
 #
 # This exists because the account commands write to ~/.ssh/config and
 # ~/.gitconfig — the two files where a bad edit hurts most. Everything is
@@ -243,7 +243,7 @@ mkdir -p "$TMP/code/plaindir"
 out="$(PATH="$FAKEBIN:$PATH" "$ACCT" _access-for-dir "$TMP/code/plaindir" 2>&1)"
 check "not a git repo -> no match" "$out" ""
 
-# gp account's own ssh alias form is still github.com and must be understood.
+# gw account's own ssh alias form is still github.com and must be understood.
 git init -q "$TMP/code/aliasremote"
 git -C "$TMP/code/aliasremote" remote add origin git@github.com-work:acme/widget.git
 mk_gh WRITE READ
@@ -343,14 +343,14 @@ check "add with no terminal doesn't route yet" \
 reset_gh; echo "repo" > "$ST/scopes"
 out="$(pg register sshy 2>&1)"; rc=$?
 check "refused + no scope + no tty fails" "$rc" "1"
-saw "says to run it in a terminal" "$out" "Run in a terminal: gp account register sshy"
+saw "says to run it in a terminal" "$out" "Run in a terminal: gw account register sshy"
 check "no switch, refresh or upload without a terminal" "$(cat "$ST/log" 2>/dev/null)" ""
 check "remote not rewritten while the key is refused" \
   "$(git -C "$TMP/code/sshy/repo" remote get-url origin)" "https://github.com/acme/widget.git"
 
 # check reports the refused key and fails.
 out="$(pg check 2>&1)"; rc=$?
-saw "check reports a refused key" "$out" "ssh key  : NOT ACCEPTED by GitHub (fix: gp account check --fix)"
+saw "check reports a refused key" "$out" "ssh key  : NOT ACCEPTED by GitHub (fix: gw account check --fix)"
 check "check fails on a refused key" "$rc" "1"
 
 # Refused, token already has the scope: upload with THAT account's token, verify, route.
@@ -494,7 +494,7 @@ saw "moved repo planned for rebind"    "$out" "plan: rebind it there"
 saw "worktree-style repo already bound" "$out" "already bound to sshy"
 saw "other account's repo is a question" "$out" "bound to work, not sshy"
 saw "no trace -> drop"                 "$out" "no repo matching by name 'nothing-like-this' was found"
-saw "no terminal: says how to apply"   "$out" "gp account sweep --yes"
+saw "no terminal: says how to apply"   "$out" "gw account sweep --yes"
 check "no terminal: nothing changed"   "$(cat "$GITPLUS_GITCONFIG")" "$before"
 
 if command -v expect >/dev/null 2>&1; then
@@ -530,7 +530,7 @@ case "$binds" in *"/wt-gone/repo"*)     bad "--yes drops the covered one" ;; *) 
 case "$binds" in *"nothing-like-this"*) bad "--yes drops the untraceable one" ;; *) ok "--yes drops the untraceable one" ;; esac
 saw "--yes keeps the conflict for you"  "$binds" "/gone/thing"
 check "git config still parses" "$(git config --file "$GITPLUS_GITCONFIG" --list >/dev/null 2>&1 && echo yes)" "yes"
-saw "check points broken bindings at sweep" "$("$ACCT" check 2>&1)" "sweep dead ones with: gp account sweep"
+saw "check points broken bindings at sweep" "$("$ACCT" check 2>&1)" "sweep dead ones with: gw account sweep"
 unset GITPLUS_SEARCH_ROOTS
 check "identity still applies after unbinding" \
   "$(git -C "$TMP/code/sshy/repo" config user.email)" "s@sshy.com"

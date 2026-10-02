@@ -4,7 +4,7 @@
 # $PWD.
 #
 # gh's "active account" is one machine-wide setting, so an agent (or any
-# non-interactive shell) that never ran gitplus' ghswitch.zsh hook talks to
+# non-interactive shell) talks to
 # GitHub as whichever account was last switched to. This resolves the binding
 # from `gp account` on every call instead, so it holds in agents, git's
 # credential helper, scripts and IDEs alike — anything that finds gh on PATH.

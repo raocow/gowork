@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# gowork (gw) — git + GitHub PR workflow, per-directory identity, and
+# dev-shell setup, behind one command.
+#
+# This is a router. The work lives in the commands it has always lived in —
+# gp and gp-* (git and pull requests), gp-account (accounts and keys), rigor
+# (shell features, identity shims, notifications) — which stay installed
+# under their own names, so nothing that calls them by name breaks. Anything
+# gowork doesn't know is handed to git, the way `gp` always did: `gw pull` is
+# `git pull`. That's why gowork's own commands avoid git's names (`notify`,
+# not `push`; `shell status`, not `status`).
+set -eo pipefail
+
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+BIN_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
+ROOT="$(cd "$BIN_DIR/.." && pwd)"
+ME="$(basename "${BASH_SOURCE[0]}")"   # gw or gowork, for messages
+
+usage() {
+  cat <<EOF
+gowork (gw) — git + GitHub workflow, per-directory identity, dev-shell setup
+
+Usage: gw <command> [args...]      (anything else goes to git: gw pull, gw log)
+
+Git and pull requests:
+  pr          pull requests: list, checkout, merge, close, unmerge
+  pl          = gw pr list            pm   = gw pr merge
+  new         create a branch and switch to it
+  switch      everything git switch does, plus worktree/PR-aware resolution
+  sync        rebase branches onto their base
+  done        finish: merge-base check, push, delete branch
+  sweep       delete merged branches (local and/or remote)
+  wsweep      delete worktrees whose branches are gone
+  haspr       check whether a branch has an open PR
+  release     tag and publish a GitHub release
+
+Identity (which GitHub account, SSH key and AWS profile a directory uses):
+  account setup|status|off        gh/aws shims, git routing, Claude sandbox
+  account add|bind|unbind|list    per-directory GitHub accounts
+  account register|check|sweep    SSH keys on GitHub; dead bindings
+  aws bind <profile> [dir]        AWS profile for a directory
+  aws unbind [dir]
+
+Shell and machine:
+  shell enable|disable <feature>  autovenv, pyf, envup
+  shell status|doctor|init
+  notify setup|status|test|off    phone notifications when agent turns end
+  sleep on|off|status             keep the Mac awake (sudo pmset)
+
+  migrate     move an existing rigor/gitplus setup over to gowork
+  version     print the version
+  help        this help
+
+Old names keep working: gp <cmd>, gp-<cmd>, rigor <cmd>.
+EOF
+}
+
+version() {
+  if [ -d "$ROOT/.git" ]; then
+    echo "gowork $(git -C "$ROOT" describe --tags --always 2>/dev/null || echo dev)"
+  else
+    local v
+    v="$(brew info --json=v2 gowork 2>/dev/null | sed -n 's/.*"installed":\[{"version":"\([^"]*\)".*/\1/p')"
+    echo "gowork ${v:-unknown}"
+  fi
+}
+
+sub_usage() {  # sub_usage <group> <subcommands>
+  echo "$ME $1: specify a subcommand ($2) — see: $ME help" >&2
+  exit 2
+}
+
+cmd="${1:-help}"
+[ "$#" -gt 0 ] && shift
+
+case "$cmd" in
+  help|--help|-h) usage ;;
+  version|--version|-v) version ;;
+
+  pr|pl|pm|new|switch|sync|done|sweep|wsweep|haspr|release)
+    exec "$BIN_DIR/gp" "$cmd" "$@" ;;
+
+  account)
+    case "${1:-}" in
+      setup|status|off) sub="$1"; shift; exec "$BIN_DIR/rigor" identity "$sub" "$@" ;;
+      *) exec "$BIN_DIR/gp-account" "$@" ;;
+    esac ;;
+
+  aws)
+    case "${1:-}" in
+      bind|unbind) sub="$1"; shift; exec "$BIN_DIR/rigor" identity "$sub" "$@" ;;
+      status)      exec "$BIN_DIR/rigor" identity status ;;
+      *)           sub_usage aws "bind, unbind, status" ;;
+    esac ;;
+
+  shell)
+    case "${1:-}" in
+      enable|disable|status|doctor|init) sub="$1"; shift; exec "$BIN_DIR/rigor" "$sub" "$@" ;;
+      *) sub_usage shell "enable, disable, status, doctor, init" ;;
+    esac ;;
+
+  notify)  exec "$BIN_DIR/rigor" push "$@" ;;
+  sleep)   exec "$BIN_DIR/rigor" sleep "$@" ;;
+  migrate) exec "$ROOT/libexec/gowork-migrate" "$@" ;;
+
+  *)
+    if git help "$cmd" >/dev/null 2>&1; then
+      exec git "$cmd" "$@"
+    fi
+    echo "$ME: unknown command '$cmd' (try: $ME help)" >&2
+    exit 1 ;;
+esac

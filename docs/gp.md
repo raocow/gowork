@@ -1,3 +1,7 @@
+> **Archived:** this is the README from before gitplus and rigor merged into
+> gowork. The commands it describes are now `gw <command>` — see the mapping in
+> the [top-level README](../README.md). Everything here still works under the old names.
+
 # gitplus
 
 Personal custom `git` subcommands. Git treats any executable named `git-<name>`

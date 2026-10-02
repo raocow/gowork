@@ -89,13 +89,11 @@ require_gh() {
 # gh has no per-repository authentication. Its "active account" is one global
 # setting in ~/.config/gh/hosts.yml, shared by every terminal, script and
 # agent on the machine; the only per-context lever it offers is the GH_TOKEN
-# environment variable. devrig's ghswitch sets that per shell on cd, which
-# works well — but only for INTERACTIVE shells, since a non-interactive one
-# (a script, a cron job, an agent's tool call) never sources ~/.zshrc and so
-# silently falls back to whatever the global account happens to be. That is
-# the failure this closes: these commands resolve the account themselves, so
-# `gp pr` in a repo bound to one identity uses that identity no matter what
-# started it.
+# environment variable. These commands resolve the account themselves, so
+# `gw pr` in a repo bound to one identity uses that identity no matter what
+# started it. With `gw account setup` the gh shim already does this for every
+# gh call (and sets nothing in the environment); this is what keeps the git
+# commands right without it, and it stands aside when GH_TOKEN is set.
 #
 # Soft dependency: without devrig, or outside a bound directory, this is a
 # no-op and gh behaves exactly as before. An already-set GH_TOKEN always

@@ -1,0 +1,94 @@
+.TH GOWORK 1 "2026-10-02" "gowork" "gowork Manual"
+.SH NAME
+gowork, gw \- git and GitHub workflow, per-directory identity, dev-shell setup
+.SH SYNOPSIS
+.B gw
+.I command
+.RI [ args ...]
+.SH DESCRIPTION
+.B gowork
+(short:
+.BR gw )
+puts three tools behind one command: the git and pull-request workflow that
+used to be
+.BR gp ,
+the account and identity management that used to be
+.B gp account
+and
+.BR "rigor identity" ,
+and the shell features that used to be
+.BR rigor .
+The old names keep working.
+.PP
+A command
+.B gw
+doesn't know is handed to git, so
+.B gw pull
+is
+.BR "git pull" .
+gowork's own commands avoid git's names for that reason.
+.SH COMMANDS
+.TP
+.BR pr ", " pl ", " pm
+Pull requests: list, check out, merge, close, unmerge.
+.B pl
+and
+.B pm
+are short for
+.B pr list
+and
+.BR "pr merge" .
+See
+.BR gp-pr (1).
+.TP
+.BR new ", " switch ", " sync ", " done ", " sweep ", " wsweep ", " haspr ", " release
+Branch and worktree workflow; see each
+.BR gp- <command>(1)
+page.
+.TP
+.B account setup\fR|\fBstatus\fR|\fBoff
+Install, inspect or remove the
+.B gh
+and
+.B aws
+shims, git's credential routing and the Claude Code sandbox exclusions.
+.TP
+.B account add\fR|\fBbind\fR|\fBunbind\fR|\fBlist\fR|\fBkey\fR|\fBregister\fR|\fBcheck\fR|\fBsweep
+Per-directory GitHub accounts and their SSH keys; see
+.BR gp-account (1).
+.TP
+.B aws bind \fIprofile\fR [\fIdir\fR] | \fBaws unbind \fR[\fIdir\fR]
+The AWS profile a directory uses.
+.TP
+.B shell enable\fR|\fBdisable\fR|\fBstatus\fR|\fBdoctor\fR|\fBinit
+Shell features: autovenv, pyf, envup; see
+.BR rigor (1).
+.TP
+.B notify setup\fR|\fBstatus\fR|\fBtest\fR|\fBoff
+Phone notifications when a Claude Code or Codex turn ends.
+.TP
+.B sleep on\fR|\fBoff\fR|\fBstatus
+Toggle
+.B pmset disablesleep
+(needs sudo).
+.TP
+.BR migrate " [" \-\-dry\-run ]
+Point an existing rigor/gitplus setup at gowork: rc-file source lines and
+completion path, Claude Code hooks, Codex's notify program, identity shims,
+and command links from a checkout install. Drops the retired
+.I ghswitch
+hook. Edited files are backed up as
+.IR <file>.gowork-bak .
+.SH FILES
+.TP
+.I ~/.config/rigor/
+Configuration, kept under its original name.
+.TP
+.I ~/.local/share/rigor/identity/bin/
+The gh and aws shims.
+.SH SEE ALSO
+.BR gp-pr (1),
+.BR gp-account (1),
+.BR rigor (1),
+.BR git (1),
+.BR gh (1)

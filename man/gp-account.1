@@ -2,7 +2,7 @@
 .SH NAME
 gp-account \- tie directories to different git/ssh/GitHub identities
 .SH SYNOPSIS
-.B gp account add
+.B gw account add
 .I NAME
 .BI \-\-email " EMAIL"
 .RI [ \-\-name " GIT-NAME"]
@@ -10,25 +10,25 @@ gp-account \- tie directories to different git/ssh/GitHub identities
 .RI [ \-\-dir " PATH"]
 .RI [ \-\-gh\-user " USER"]
 .br
-.B gp account bind
+.B gw account bind
 .I NAME DIR
 .br
-.B gp account list
+.B gw account list
 .br
-.B gp account key
+.B gw account key
 .I NAME
 .br
-.B gp account register
+.B gw account register
 .I NAME
 .br
-.B gp account check
+.B gw account check
 .RB [ \-\-fix ]
 .SH DESCRIPTION
 Work split across more than one GitHub account \(em a personal one and an
 employer's \(em normally means remembering to set
 .I user.email
 per clone and juggling ssh keys by hand.
-.B gp account
+.B gw account
 sets an account up once, and every repository under a bound directory then
 commits as it, reaches the host with its key, and (with
 .BR \-\-gh\-user )
@@ -101,14 +101,14 @@ The git host. Defaults to
 Bind the account to
 .I PATH
 in the same step, equivalent to a following
-.BR "gp account bind" .
+.BR "gw account bind" .
 .TP
 .BI \-\-gh\-user " USER"
 Pair the account with a
 .B gh
-CLI login. This is what lets the other commands, and the optional
-.I ghswitch
-shell hook, pick the right GitHub identity per directory.
+CLI login. This is what lets the other commands, and the gh shim that
+.B gw account setup
+installs, pick the right GitHub identity per directory.
 .SH SUBCOMMANDS
 .TP
 .B check
@@ -124,20 +124,21 @@ that git really resolves the expected address.
 .B key
 Print the account's public key again \(em for pasting into the host, or for
 authorising it against an SSO-enforcing organisation.
-.SH SHELL HOOK
-.I share/zsh/ghswitch.zsh
-is optional and keeps
-.BR gh 's
-identity matched to the directory you are in, per shell, by exporting
-.B GH_TOKEN
-rather than changing
-.BR gh 's
-machine-wide active account. Source it from your
-.IR ~/.zshrc .
-Without it the commands still resolve the right account themselves; the hook
-only helps bare
+.SH GH SHIM
+.B gw account setup
+installs a
 .B gh
-invocations you type yourself.
+shim, first on
+.BR PATH ,
+that looks up the binding for the directory it runs in and passes that
+account's token to the real
+.B gh
+for that one call. It works in every process \(em agents, scripts, git's
+credential helper \(em and never changes
+.BR gh 's
+machine-wide active account. It replaces the old
+.I ghswitch
+shell hook, which only ran in interactive shells.
 .SH HISTORY
 This was
 .B devrig account
@@ -181,10 +182,10 @@ file permissions only.
 .PP
 .nf
 .RS
-gp account add work --email me@work.com --dir ~/code/work --gh-user work-gh
+gw account add work --email me@work.com --dir ~/code/work --gh-user work-gh
 # paste the printed key into that host account, then:
 git clone git@github.com-work:acme/api.git ~/code/work/api
-gp account check
+gw account check
 .RE
 .fi
 .SH SEE ALSO

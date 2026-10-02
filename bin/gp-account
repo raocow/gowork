@@ -11,19 +11,19 @@
 # Nothing is sourced into your shell: git reads `includeIf` out of your git
 # config and ssh reads the `Host` alias out of your ssh config on their own,
 # so this is persistent config plus a keypair. The one shell-level piece is
-# optional — see share/zsh/ghswitch.zsh, which keeps `gh`'s identity matched
+# optional — `gw account setup` installs a gh shim that keeps `gh`'s identity matched
 # to the directory you're standing in.
 #
 # Usage:
-#   gp account add <name> --email <email> [--name <git name>]
+#   gw account add <name> --email <email> [--name <git name>]
 #                          [--host <host>] [--dir <path>] [--gh-user <user>]
-#   gp account bind <name> <dir>   use <name>'s identity in <dir> and below
-#   gp account unbind <name> <dir> drop a binding
-#   gp account sweep [--yes]       trace dead bindings: drop, rebind, or ask
-#   gp account list                accounts and their bound directories
-#   gp account key <name>          print the public key to paste into the host
-#   gp account register <name>     get the key onto GitHub, then route bound repos over ssh
-#   gp account check [--fix]       verify every binding and key still applies
+#   gw account bind <name> <dir>   use <name>'s identity in <dir> and below
+#   gw account unbind <name> <dir> drop a binding
+#   gw account sweep [--yes]       trace dead bindings: drop, rebind, or ask
+#   gw account list                accounts and their bound directories
+#   gw account key <name>          print the public key to paste into the host
+#   gw account register <name>     get the key onto GitHub, then route bound repos over ssh
+#   gw account check [--fix]       verify every binding and key still applies
 #
 # This lived in `devrig account` until gitplus grew a hard dependency on it:
 # every git-* command resolves the bound account before calling gh, so the
@@ -45,22 +45,22 @@ source "$(cd -P "$(dirname "$_src")/.." && pwd)/lib/gitplus-common.sh"
 
 usage() {
   cat <<'EOF'
-gp account — tie directories to different git/ssh/GitHub identities.
+gw account — tie directories to different git/ssh/GitHub identities.
 
-  gp account add <name> --email <email> [--name <git name>]
+  gw account add <name> --email <email> [--name <git name>]
                          [--host <host>] [--dir <path>] [--gh-user <user>]
-  gp account bind <name> <dir>   use <name>'s identity in <dir> and below
-  gp account unbind <name> <dir> drop a binding
-  gp account sweep [--yes]       trace bindings whose directory is gone: drop,
+  gw account bind <name> <dir>   use <name>'s identity in <dir> and below
+  gw account unbind <name> <dir> drop a binding
+  gw account sweep [--yes]       trace bindings whose directory is gone: drop,
                                  rebind where the repo moved, or ask
-  gp account list                accounts and their bound directories
-  gp account key <name>          print the public key to paste into the host
-  gp account register <name>     get <name>'s key accepted by GitHub (one browser
+  gw account list                accounts and their bound directories
+  gw account key <name>          print the public key to paste into the host
+  gw account register <name>     get <name>'s key accepted by GitHub (one browser
                                  approval the first time), then route its bound
                                  repos over ssh
-  gp account check [--fix]       verify every binding and key still applies;
+  gw account check [--fix]       verify every binding and key still applies;
                                  --fix registers refused keys and turns routing on
-  gp account -h                  show this help
+  gw account -h                  show this help
 
 Nothing is sourced into your shell — git reads includeIf and ssh reads the
 Host alias on their own. `check` is the one worth running: a renamed or moved
@@ -119,7 +119,7 @@ _acct_ghuser() {  # gh CLI username recorded for an account, empty if none
 # directory — the NEAREST bound account (longest matching bound dir wins,
 # same "current directory is authoritative" rule as autovenv) that has a
 # --gh-user recorded, or nothing if outside every bound scope or the nearest
-# one has none. Used by the ghswitch shell feature; also handy to call by
+# one has none. Used by the gh shim and gitplus-common; also handy to call by
 # hand when checking why a directory isn't switching.
 acct_gh_for_dir() {
   local target="${1:-$PWD}" main
@@ -246,7 +246,7 @@ acct_add() {
   local name="${1:-}"; shift 2>/dev/null || true
   local email="" gitname="" host="github.com" dir="" ghuser=""
   if ! _acct_valid_name "$name"; then
-    echo "gp account: account name required (letters, digits, . _ - only)" >&2; return 2
+    echo "gw account: account name required (letters, digits, . _ - only)" >&2; return 2
   fi
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -255,11 +255,11 @@ acct_add() {
       --host)    host="${2:-}"; shift 2 || return 2 ;;
       --dir)     dir="${2:-}"; shift 2 || return 2 ;;
       --gh-user) ghuser="${2:-}"; shift 2 || return 2 ;;
-      *) echo "gp account: unknown option '$1'" >&2; return 2 ;;
+      *) echo "gw account: unknown option '$1'" >&2; return 2 ;;
     esac
   done
-  [ -n "$email" ] || { echo "gp account: --email is required" >&2; return 2; }
-  [ -n "$host" ]  || { echo "gp account: --host cannot be empty" >&2; return 2; }
+  [ -n "$email" ] || { echo "gw account: --email is required" >&2; return 2; }
+  [ -n "$host" ]  || { echo "gw account: --host cannot be empty" >&2; return 2; }
   gitname="${gitname:-$name}"
 
   local key alias identity
@@ -307,7 +307,7 @@ acct_add() {
     echo "wrote identity: ${identity/#$HOME/~}  ($gitname <$email>)"
   fi
 
-  # --gh-user pairs this account with a `gh` CLI login (see the ghswitch
+  # --gh-user pairs this account with a `gh` CLI login (see the gh shim,
   # feature) so a bound directory keeps the right gh identity active — gh's
   # own "active account" is a single global setting shared by every terminal,
   # so anything else using a different identity anywhere can flip it back.
@@ -318,7 +318,7 @@ acct_add() {
     if [ "$existing" = "$ghuser" ]; then
       echo "gh user already recorded: $ghuser"
     elif [ -n "$existing" ]; then
-      echo "gp account: gh user already set to '$existing' for '$name' — edit the" >&2
+      echo "gw account: gh user already set to '$existing' for '$name' — edit the" >&2
       echo "  # gitplus:ghuser:$name line in $SSH_CONFIG by hand to change it" >&2
     else
       printf '# gitplus:ghuser:%s %s\n' "$name" "$ghuser" >> "$SSH_CONFIG"
@@ -339,7 +339,7 @@ acct_add() {
 
   echo ""
   echo "Add this key to the $host account '$name' (or, with --gh-user set,"
-  echo "run: gp account register $name):"
+  echo "run: gw account register $name):"
   echo ""
   cat "$key.pub"
   echo ""
@@ -428,7 +428,7 @@ _acct_grant_key_scope() {
   prev="$(_acct_active_gh)"
   if [ "$prev" != "$ghuser" ]; then
     env -u GH_TOKEN -u GITHUB_TOKEN gh auth switch --hostname github.com --user "$ghuser" >/dev/null 2>&1 \
-      || { echo "gp account: couldn't switch gh to $ghuser" >&2; return 1; }
+      || { echo "gw account: couldn't switch gh to $ghuser" >&2; return 1; }
     # shellcheck disable=SC2064  # $prev is meant to be expanded now
     trap "env -u GH_TOKEN -u GITHUB_TOKEN gh auth switch --hostname github.com --user '$prev' >/dev/null 2>&1; exit 130" INT TERM
   fi
@@ -444,15 +444,15 @@ _acct_grant_key_scope() {
   return "$rc"
 }
 
-# gp account register <name> — get the account's key accepted by GitHub, then
+# gw account register <name> — get the account's key accepted by GitHub, then
 # route its bound repos over ssh. Safe to re-run: a key that already works is
 # only verified.
 acct_register() {
   local name="${1:-}"
-  _acct_valid_name "$name" || { echo "gp account: account name required" >&2; return 2; }
+  _acct_valid_name "$name" || { echo "gw account: account name required" >&2; return 2; }
   local key ghuser host who rc tok scopes
   key="$(_acct_key "$name").pub"; ghuser="$(_acct_ghuser "$name")"; host="$(_acct_host "$name")"
-  [ -f "$key" ] || { echo "gp account: no public key for '$name' ($key)" >&2; return 1; }
+  [ -f "$key" ] || { echo "gw account: no public key for '$name' ($key)" >&2; return 1; }
 
   rc=0; who="$(_acct_ssh_user "$name")" || rc=$?
   if [ "$rc" -eq 0 ]; then
@@ -479,7 +479,7 @@ acct_register() {
   fi
   tok="$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --hostname github.com --user "$ghuser" 2>/dev/null)" || tok=""
   if [ -z "$tok" ]; then
-    echo "gp account: gh isn't logged in as $ghuser (run: gh auth login --hostname github.com)" >&2
+    echo "gw account: gh isn't logged in as $ghuser (run: gh auth login --hostname github.com)" >&2
     return 1
   fi
   scopes="$(_acct_scopes "$tok")"
@@ -488,10 +488,10 @@ acct_register() {
     *)
       if [ ! -t 0 ] || [ ! -t 1 ]; then
         echo "ssh key  : not accepted by GitHub, and adding it needs a one-time browser" >&2
-        echo "           approval. Run in a terminal: gp account register $name" >&2
+        echo "           approval. Run in a terminal: gw account register $name" >&2
         return 1
       fi
-      _acct_grant_key_scope "$ghuser" || { echo "gp account: approval didn't complete" >&2; return 1; }
+      _acct_grant_key_scope "$ghuser" || { echo "gw account: approval didn't complete" >&2; return 1; }
       tok="$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --hostname github.com --user "$ghuser" 2>/dev/null)"
       ;;
   esac
@@ -526,12 +526,12 @@ acct_register() {
 acct_bind() {
   local name="${1:-}" dir="${2:-}"
   if ! _acct_valid_name "$name"; then
-    echo "gp account: account name required" >&2; return 2
+    echo "gw account: account name required" >&2; return 2
   fi
-  [ -n "$dir" ] || { echo "gp account: directory required" >&2; return 2; }
+  [ -n "$dir" ] || { echo "gw account: directory required" >&2; return 2; }
   local identity; identity="$(_acct_identity "$name")"
   if [ ! -f "$identity" ]; then
-    echo "gp account: no such account '$name' (run: gp account add $name --email ...)" >&2
+    echo "gw account: no such account '$name' (run: gw account add $name --email ...)" >&2
     return 1
   fi
   dir="$(_acct_abspath "$dir")"
@@ -559,15 +559,13 @@ acct_bind() {
   # Deliberately does NOT run `gh auth switch` to apply this immediately.
   # That setting is global to the whole machine, so writing it here would
   # yank the identity out from under every other terminal and agent session
-  # currently working as a different account. Applying the new binding to the
-  # shell you're standing in is the ghswitch feature's job, and it does it
-  # per-shell via GH_TOKEN (its `devrig` wrapper re-runs the hook right after
-  # this command returns, since a subprocess can't export into its parent).
+  # currently working as a different account. Nothing needs applying: the gh
+  # shim reads the bindings on every call, so the next gh command uses it.
   return 0
 }
 
-# gp account unbind <name> <dir>   drop one binding
-# gp account unbind --missing      drop every binding whose directory is gone
+# gw account unbind <name> <dir>   drop one binding
+# gw account unbind --missing      drop every binding whose directory is gone
 #
 # The one edit here that rewrites ~/.gitconfig rather than appending to it, so
 # it removes only lines between a binding's own BEGIN/END sentinels, checks
@@ -588,11 +586,11 @@ EOF
   else
     name="${1:-}"; dir="${2:-}"
     _acct_valid_name "$name" && [ -n "$dir" ] \
-      || { echo "usage: gp account unbind <name> <dir> | --missing" >&2; return 2; }
+      || { echo "usage: gw account unbind <name> <dir> | --missing" >&2; return 2; }
     # Exactly as recorded when it exists; resolved like bind did when it doesn't.
     if ! _acct_binds | grep -qxF "$name $dir"; then dir="$(_acct_abspath "$dir")"; fi
     if ! _acct_binds | grep -qxF "$name $dir"; then
-      echo "gp account: '$name' is not bound to $dir" >&2; return 1
+      echo "gw account: '$name' is not bound to $dir" >&2; return 1
     fi
     pairs="$name $dir
 "
@@ -627,7 +625,7 @@ _acct_unbind_pairs() {
   ' "$GITCONFIG" > "$tmp"
   if ! git config --file "$tmp" --list >/dev/null 2>&1; then
     rm -f "$tmp"
-    echo "gp account: result didn't parse as git config — left $GITCONFIG untouched" >&2
+    echo "gw account: result didn't parse as git config — left $GITCONFIG untouched" >&2
     return 1
   fi
   cp "$GITCONFIG" "$GITCONFIG.gitplus-bak"
@@ -670,7 +668,7 @@ _acct_repo_index() {
   done
 }
 
-# gp account sweep [--yes] — deal with bindings whose directory is gone.
+# gw account sweep [--yes] — deal with bindings whose directory is gone.
 #
 # A dead binding usually means the repo moved, or was a worktree that got
 # removed, and dropping it blindly loses which account a moved repo should
@@ -780,7 +778,7 @@ EOF
   nr="$(printf '%s' "$rebinds" | grep -c . || true)"
   if [ "$nd" -eq 0 ]; then echo "nothing to change ($kept kept)."; return 0; fi
   if [ -z "$ask" ] && [ -z "$yes" ]; then
-    echo "nothing changed. Run it in a terminal to decide, or accept this plan: gp account sweep --yes"
+    echo "nothing changed. Run it in a terminal to decide, or accept this plan: gw account sweep --yes"
     return 0
   fi
   if [ -n "$ask" ]; then
@@ -800,7 +798,7 @@ EOF
 acct_list() {
   local names; names="$(_acct_names)"
   if [ -z "$names" ]; then
-    echo "no accounts registered (gp account add <name> --email <email>)"
+    echo "no accounts registered (gw account add <name> --email <email>)"
     return 0
   fi
   local n line d
@@ -827,9 +825,9 @@ EOF
 
 acct_key() {
   local name="${1:-}" key
-  _acct_valid_name "$name" || { echo "gp account: account name required" >&2; return 2; }
+  _acct_valid_name "$name" || { echo "gw account: account name required" >&2; return 2; }
   key="$(_acct_key "$name").pub"
-  [ -f "$key" ] || { echo "gp account: no public key for '$name' ($key)" >&2; return 1; }
+  [ -f "$key" ] || { echo "gw account: no public key for '$name' ($key)" >&2; return 1; }
   cat "$key"
 }
 
@@ -888,7 +886,7 @@ acct_check() {
         elif [ -n "$fix" ]; then
           printf '  '; _acct_route_ssh "$n" || problems=$((problems + 1))
         else
-          echo "  routing  : off (https remotes use gh's token; turn on with: gp account check --fix)"
+          echo "  routing  : off (https remotes use gh's token; turn on with: gw account check --fix)"
         fi
       elif [ "$src" -eq 0 ]; then
         echo "  ssh key  : WRONG ACCOUNT — accepted as $who, not $ghuser"
@@ -900,7 +898,7 @@ acct_check() {
           # browser approval, and checks for it.
           acct_register "$n" <&3 || problems=$((problems + 1))
         else
-          echo "  ssh key  : NOT ACCEPTED by GitHub (fix: gp account check --fix)"
+          echo "  ssh key  : NOT ACCEPTED by GitHub (fix: gw account check --fix)"
           problems=$((problems + 1))
         fi
       else
@@ -917,7 +915,7 @@ acct_check() {
         # no longer there, so nothing applies it and commits go out as you.
         echo "  bind     : BROKEN ${d/#$HOME/~} (directory does not exist —"
         echo "             renamed or moved? commits there use your global identity;"
-        echo "             sweep dead ones with: gp account sweep)"
+        echo "             sweep dead ones with: gw account sweep)"
         problems=$((problems + 1)); continue
       fi
       # Prove it end-to-end where we can: includeIf only evaluates inside a
@@ -968,10 +966,10 @@ cmd_account() {
     key)   shift; acct_key "$@" ;;
     check) shift 2>/dev/null || true; acct_check "$@" ;;
     register) shift; acct_register "$@" ;;
-    # Internal, not in `devrig help` — used by the ghswitch shell feature.
+    # Internal, not in the help — used by the gh shim and gitplus-common.
     _gh-for-dir) shift; acct_gh_for_dir "$@" ;;
     _access-for-dir) shift; acct_access_for_dir "$@" ;;
-    *) echo "gp account: unknown command '$1' (add, bind, unbind, sweep, list, key, register, check)" >&2; return 2 ;;
+    *) echo "gw account: unknown command '$1' (add, bind, unbind, sweep, list, key, register, check)" >&2; return 2 ;;
   esac
 }
 
