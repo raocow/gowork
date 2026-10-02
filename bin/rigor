@@ -299,7 +299,7 @@ cmd_status() {
   # wrote. Mentioned here rather than dropped silently, since `rigor status`
   # used to list accounts and someone will wonder where they went.
   if command -v gp-account >/dev/null 2>&1 && [ -n "$(gp-account list 2>/dev/null | head -1)" ]; then
-    echo "accounts: moved to gitplus — see 'gw account list'"
+    echo "accounts: see 'gw account list'"
   fi
   # push is not an rc feature, so it has no line above. Reported anyway: it
   # changes what your phone does, and `rigor status` is where you look.
@@ -795,7 +795,7 @@ _ident_status() {
     "")  if command -v gp-account >/dev/null 2>&1; then
            echo "  gh      : unbound — gh's active account (bind: gw account bind <name> <dir>)"
          else
-           echo "  gh      : gitplus not installed — gh's active account"
+           echo "  gh      : account tools (gp-account) not found — gh's active account"
          fi ;;
     *)   echo "  gh      : $r" ;;
   esac
@@ -934,7 +934,7 @@ case "${1:-help}" in
   # usage dump. Forwards the arguments so the suggestion is runnable as-is.
   account|accounts)
     shift
-    echo "rigor: accounts moved to gitplus — run: gw account${*:+ $*}" >&2
+    echo "rigor: accounts live under gw account — run: gw account${*:+ $*}" >&2
     echo "  (your existing accounts and bindings still work there, unchanged)" >&2
     exit 1 ;;
   sleep)                shift; cmd_sleep "$@" ;;

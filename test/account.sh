@@ -372,6 +372,7 @@ out="$(pg register sshy 2>&1)"; rc=$?
 check "register with scope succeeds" "$rc" "0"
 saw "uploads with the account's own token" "$(cat "$ST/log")" "post tok-sshy-gh"
 saw "verifies after upload" "$out" "verified — GitHub accepts it as sshy-gh"
+saw "uploaded key is titled for gowork" "$out" 'added to sshy-gh as "gowork sshy ('
 check "https remote now goes over the alias" \
   "$(git -C "$TMP/code/sshy/repo" remote get-url origin)" "git@github.com-sshy:acme/widget.git"
 git -C "$TMP/code/sshy/repo" remote set-url origin git@github.com:acme/widget.git
@@ -496,7 +497,7 @@ case "$binds" in *"$TMP/code/drop"*) bad "binding removed" ;; *) ok "binding rem
 saw "neighbouring binding kept" "$binds" "$TMP/code/keep"
 check "git config still parses" "$(git config --file "$GITPLUS_GITCONFIG" --list >/dev/null 2>&1 && echo yes)" "yes"
 check "its blank separator went with it" "$(grep -c '^$' "$GITPLUS_GITCONFIG")" "$((blanks_before - 1))"
-[ -f "$GITPLUS_GITCONFIG.gitplus-bak" ] && ok "backup kept" || bad "backup kept"
+[ -f "$GITPLUS_GITCONFIG.gowork-bak" ] && ok "backup kept" || bad "backup kept"
 
 out="$("$ACCT" unbind sshy "$TMP/code/never-bound" 2>&1)"; rc=$?
 check "unbinding something not bound fails" "$rc" "1"
@@ -559,7 +560,7 @@ if command -v expect >/dev/null 2>&1; then
   case "$binds" in *"/code/new/renamed"*) bad "answering d drops instead of rebinding" ;; *) ok "answering d drops instead of rebinding" ;; esac
   case "$binds" in *"/code/old/proj"*) bad "old moved binding removed" ;; *) ok "old moved binding removed" ;; esac
   saw "answering k keeps the other account's question" "$binds" "/gone/thing"
-  cp "$GITPLUS_GITCONFIG.gitplus-bak" "$GITPLUS_GITCONFIG"   # back to the scenario for --yes
+  cp "$GITPLUS_GITCONFIG.gowork-bak" "$GITPLUS_GITCONFIG"   # back to the scenario for --yes
 else
   echo "  skip interactive sweep (no expect)"
 fi

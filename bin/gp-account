@@ -461,7 +461,10 @@ _acct_await_sso() {
     echo "           $owner), then run: gw account check --fix"
     return 1
   fi
-  echo "           Opening $url. Next to \"gitplus $name …\", click Configure SSO,"
+  # By fingerprint, which the page shows under every key: the title depends
+  # on which version uploaded it ("gitplus …" before the rename to gowork).
+  local fp; fp="$(ssh-keygen -lf "$(_acct_key "$name").pub" 2>/dev/null | awk '{print $2}')"
+  echo "           Opening $url. Find the key ${fp:-for $name}, click Configure SSO,"
   echo "           then Authorize next to $owner. Waiting for it (Ctrl-C to stop)…"
   if [ -n "${GITPLUS_OPEN:-}" ]; then "$GITPLUS_OPEN" "$url" >/dev/null 2>&1 || true
   elif [ -x "$BROWSER_HELPER" ]; then "$BROWSER_HELPER" open "$name" "$url" >/dev/null 2>&1 || true
@@ -588,7 +591,7 @@ acct_register() {
   esac
 
   local title out
-  title="gitplus $name ($(hostname -s 2>/dev/null || echo this-mac))"
+  title="gowork $name ($(hostname -s 2>/dev/null || echo this-mac))"
   if ! out="$(GH_TOKEN="$tok" gh api -X POST user/keys -f title="$title" -f key="$(cat "$key")" 2>&1)"; then
     case "$out" in
       *"already in use"*)
@@ -719,7 +722,7 @@ _acct_unbind_pairs() {
     echo "gw account: result didn't parse as git config — left $GITCONFIG untouched" >&2
     return 1
   fi
-  cp "$GITCONFIG" "$GITCONFIG.gitplus-bak"
+  cp "$GITCONFIG" "$GITCONFIG.gowork-bak"
   cat "$tmp" > "$GITCONFIG"    # in place, so a symlinked dotfile stays a symlink
   rm -f "$tmp"
   local p
@@ -728,7 +731,7 @@ _acct_unbind_pairs() {
   done <<EOF
 $pairs
 EOF
-  echo "backup: ${GITCONFIG/#$HOME/~}.gitplus-bak"
+  echo "backup: ${GITCONFIG/#$HOME/~}.gowork-bak"
 }
 
 _acct_tilde() { case "$1" in "$HOME"|"$HOME"/*) echo "~${1#"$HOME"}" ;; *) echo "$1" ;; esac; }
