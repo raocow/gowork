@@ -295,9 +295,20 @@ ST="$TMP/ghstate"; mkdir -p "$ST"
 # every alias, for the wrong-account case.
 cat > "$FAKEBIN/ssh" <<EOF
 #!/usr/bin/env bash
-host="\${@: -1}"; host="\${host#git@}"
+# The git@<alias> argument, wherever it is; a trailing git-upload-pack command
+# means a real repo read, which SSO can refuse even for an accepted key.
+host=""; cmd=""
+for a in "\$@"; do case "\$a" in git@*) host="\${a#git@}" ;; git-upload-pack*) cmd="\$a" ;; esac; done
 for f in "$ST/accepted-\$host" "$ST/accepted"; do
   if [ -f "\$f" ]; then
+    if [ -n "\$cmd" ]; then
+      if [ -f "$ST/sso-pending-\$host" ]; then
+        echo "ERROR: The 'acme' organization has enabled or enforced SAML SSO. To access this repository, you must use the HTTPS remote with a personal access token or SSH key and password that has been authorized for this organization."
+        exit 1
+      fi
+      printf '0123abcd HEAD\\n0123abcd refs/heads/main\\n'
+      exit 0
+    fi
     echo "Hi \$(cat "\$f")! You've successfully authenticated, but GitHub does not provide shell access."
     exit 1
   fi
@@ -392,6 +403,22 @@ out="$(pg register sshy 2>&1)"; rc=$?
 check "upload refusal fails" "$rc" "1"
 saw "explains key already in use" "$out" "GitHub has this key on a different account already"
 
+echo "== register: SSO authorization (the key works, the org still refuses it) =="
+reset_gh; echo "repo, write:public_key" > "$ST/scopes"; touch "$ST/sso-pending-github.com-sshy"
+git -C "$TMP/code/sshy/repo" config --unset-all url.git@github.com-sshy:.insteadof 2>/dev/null
+sed -i.bak '/gitplus:route-ssh BEGIN/,/gitplus:route-ssh END/d' "$TMP/.gitconfig-sshy"
+out="$(pg register sshy 2>&1)"; rc=$?
+check "uploaded but SSO-refused fails" "$rc" "1"
+saw "says the org requires SSO authorization" "$out" "acme requires it to be authorized for SSO"
+saw "says where to authorize it" "$out" "https://github.com/settings/keys"
+_acct_routes() { grep -qF "gitplus:route-ssh BEGIN" "$TMP/.gitconfig-sshy"; }
+_acct_routes && bad "no routing while SSO refuses the key" || ok "no routing while SSO refuses the key"
+out="$(pg check 2>&1)"
+saw "check reports NOT AUTHORIZED" "$out" "but NOT AUTHORIZED for acme (SSO)"
+rm -f "$ST/sso-pending-github.com-sshy"
+out="$(pg check --fix 2>&1)"
+_acct_routes && ok "once authorized, check --fix routes" || bad "once authorized, check --fix routes"
+
 echo "== register: the one-time browser approval =="
 # Needs a terminal; script(1) provides one. gh can only refresh the ACTIVE
 # account, so register switches to it and must always switch back.
@@ -418,6 +445,19 @@ if script -q /dev/null true </dev/null >/dev/null 2>&1; then
   # approval; what matters is that it got one, and switched back.
   saw "check --fix gets the browser approval to the terminal" \
     "$(tr '\n' '|' < "$ST/log" 2>/dev/null)" "switch work-gh|refresh as work-gh|switch other-gh|post tok-work-gh|"
+
+  # SSO: opens the keys page and waits until the repo is readable.
+  reset_gh; echo "repo, write:public_key" > "$ST/scopes"; touch "$ST/sso-pending-github.com-sshy"
+  sed -i.bak '/gitplus:route-ssh BEGIN/,/gitplus:route-ssh END/d' "$TMP/.gitconfig-sshy"
+  cat > "$FAKEBIN/open" <<EOF
+#!/usr/bin/env bash
+echo "opened \$1" >> "$ST/log"; rm -f "$ST/sso-pending-github.com-sshy"   # the user clicks Authorize
+EOF
+  chmod +x "$FAKEBIN/open"
+  out="$(GITPLUS_OPEN="$FAKEBIN/open" GITPLUS_SSO_POLL=0 inpty "$ACCT" register sshy 2>&1)"
+  saw "opens the SSH keys page" "$(cat "$ST/log")" "opened https://github.com/settings/keys"
+  saw "waits, then confirms authorization" "$out" "authorized — acme/widget is reachable over ssh"
+  _acct_routes && ok "routes once authorized" || bad "routes once authorized"
 
   reset_gh; echo "repo" > "$ST/scopes"; echo sshy-gh > "$ST/active"
   inpty "$ACCT" register sshy >/dev/null 2>&1

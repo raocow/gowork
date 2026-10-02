@@ -409,6 +409,88 @@ _acct_route_ssh() {
   echo "routing  : on — repos bound to '$name' now push and pull over git@$alias"
 }
 
+# _acct_test_repo <name> — owner/repo of a repository bound to the account (a
+# bound repo itself, or one directly inside a bound directory), to test real
+# access against. Fails when there's none.
+_acct_test_repo() {
+  local line d cand slug
+  while IFS= read -r line; do
+    [ "${line%% *}" = "$1" ] || continue
+    d="${line#* }"
+    [ -d "$d" ] || continue
+    for cand in "$d" "$d"/*; do
+      [ -d "$cand/.git" ] || continue
+      slug="$(_acct_repo_slug "$cand" 2>/dev/null || true)"
+      if [ -n "$slug" ]; then echo "$slug"; return 0; fi
+    done
+  done <<EOF
+$(_acct_binds)
+EOF
+  return 1
+}
+
+# _acct_repo_access <name> — can the key actually read one of the account's
+# repos? `ssh -T` only says whose key it is: it succeeds for a key that an
+# organization enforcing SAML SSO still refuses, so every fetch and push fails
+# while the key looks fine. This asks for the refs the way git does.
+# 0 = readable (or no bound repo to test), 1 = refused, 2 = couldn't ask.
+_acct_repo_access() {
+  local alias slug out
+  alias="$(_acct_alias "$1")"
+  slug="$(_acct_test_repo "$1")" || return 0
+  out="$("$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=10 "git@$alias" \
+         "git-upload-pack '$slug.git'" </dev/null 2>&1)" || true
+  case "$out" in
+    *refs/heads/*|*" HEAD"*) return 0 ;;
+    *"Could not resolve"*|*"timed out"*|*"Broken pipe"*|*"Connection refused"*) return 2 ;;
+  esac
+  return 1
+}
+
+# _acct_await_sso <name> <owner/repo> — the key works but the owner's SSO
+# hasn't authorized it. GitHub only offers that as a button (no API), so open
+# the page, say what to click, and wait until the repo is readable.
+_acct_await_sso() {
+  local name="$1" slug="$2" owner="${2%%/*}" url="https://github.com/settings/keys"
+  echo "ssh key  : GitHub accepts it, but $owner requires it to be authorized for SSO."
+  if [ ! -t 0 ] || [ ! -t 1 ]; then
+    echo "           Authorize it at $url (Configure SSO, then Authorize next to"
+    echo "           $owner), then run: gw account check --fix"
+    return 1
+  fi
+  echo "           Opening $url. Next to \"gitplus $name …\", click Configure SSO,"
+  echo "           then Authorize next to $owner. Waiting for it (Ctrl-C to stop)…"
+  ${GITPLUS_OPEN:-open} "$url" >/dev/null 2>&1 || true
+  local i rc
+  for i in $(seq 1 "${GITPLUS_SSO_TRIES:-120}"); do
+    sleep "${GITPLUS_SSO_POLL:-5}"
+    rc=0; _acct_repo_access "$name" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      echo "ssh key  : authorized — $slug is reachable over ssh"
+      return 0
+    fi
+  done
+  echo "           Still not authorized. Once it is: gw account check --fix" >&2
+  return 1
+}
+
+# Verified key -> confirm it can really read the account's repos (walking
+# through SSO authorization if that's what's missing) -> only then route
+# over ssh. Routing a key that SSO still refuses breaks every https remote it
+# rewrites.
+_acct_finish() {
+  local name="$1" rc=0 slug
+  _acct_repo_access "$name" || rc=$?
+  if [ "$rc" -eq 1 ]; then
+    slug="$(_acct_test_repo "$name" || true)"
+    _acct_await_sso "$name" "$slug" || return 1
+  elif [ "$rc" -eq 2 ]; then
+    echo "ssh key  : couldn't reach GitHub to test repo access; routing left as it is" >&2
+    return 1
+  fi
+  _acct_route_ssh "$name"
+}
+
 _acct_scopes() {  # _acct_scopes <token> — the token's OAuth scopes, comma-separated
   GH_TOKEN="$1" gh api -i user 2>/dev/null \
     | sed -n 's/^[Xx]-[Oo][Aa]uth-[Ss]copes:[[:space:]]*//p' | tr -d '\r' | head -1 || true
@@ -462,7 +544,7 @@ acct_register() {
       return 1
     fi
     echo "ssh key  : ok — $host accepts it as $who"
-    _acct_route_ssh "$name"
+    _acct_finish "$name"
     return
   fi
   if [ "$rc" -eq 2 ]; then
@@ -514,7 +596,7 @@ acct_register() {
   rc=0; who="$(_acct_ssh_user "$name")" || rc=$?
   if [ "$rc" -eq 0 ] && [ "$who" = "$ghuser" ]; then
     echo "ssh key  : verified — GitHub accepts it as $who"
-    _acct_route_ssh "$name"
+    _acct_finish "$name"
   else
     echo "ssh key  : added, but ssh still isn't accepted as $ghuser." >&2
     echo "           If the org uses SAML SSO, authorize the key for it at" >&2
@@ -880,13 +962,27 @@ acct_check() {
       local who src
       src=0; who="$(_acct_ssh_user "$n")" || src=$?
       if [ "$src" -eq 0 ] && { [ -z "$ghuser" ] || [ "$who" = "$ghuser" ]; }; then
-        echo "  ssh key  : ok (accepted as $who)"
-        if _acct_routes_ssh "$n"; then
-          echo "  routing  : https -> ssh"
-        elif [ -n "$fix" ]; then
-          printf '  '; _acct_route_ssh "$n" || problems=$((problems + 1))
+        local arc=0
+        _acct_repo_access "$n" || arc=$?
+        if [ "$arc" -eq 1 ]; then
+          local tslug; tslug="$(_acct_test_repo "$n" || true)"
+          echo "  ssh key  : accepted as $who, but NOT AUTHORIZED for ${tslug%%/*} (SSO) — git there fails"
+          if [ -n "$fix" ]; then
+            if _acct_await_sso "$n" "$tslug" <&3; then printf '  '; _acct_route_ssh "$n"
+            else problems=$((problems + 1)); fi
+          else
+            echo "             fix: gw account check --fix"
+            problems=$((problems + 1))
+          fi
         else
-          echo "  routing  : off (https remotes use gh's token; turn on with: gw account check --fix)"
+          echo "  ssh key  : ok (accepted as $who)"
+          if _acct_routes_ssh "$n"; then
+            echo "  routing  : https -> ssh"
+          elif [ -n "$fix" ]; then
+            printf '  '; _acct_route_ssh "$n" || problems=$((problems + 1))
+          else
+            echo "  routing  : off (https remotes use gh's token; turn on with: gw account check --fix)"
+          fi
         fi
       elif [ "$src" -eq 0 ]; then
         echo "  ssh key  : WRONG ACCOUNT — accepted as $who, not $ghuser"
