@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#
+# gp-new — create a branch and switch to it.
+#
+# A thin wrapper around `git switch -c`, whose real point is the Tab
+# completion: `gp new <TAB>` cycles through short words already used in this
+# repo's existing branch names (via zsh's _multi_parts), so composing a short
+# name is a few Tab presses instead of typing a sentence. That completion
+# works no matter who or what is driving the shell — it fires on the git
+# command itself, not on any tool choosing to cooperate.
+#
+# Usage:
+#   gp new <name>            create <name> from the current branch, switch to it
+#   gp new -b <base> <name>  create <name> from <base> instead
+#   gp new -h                show this help
+#
+set -euo pipefail
+
+# Resolve this script's real location (following symlinks — it's installed as
+# one) to find lib/gitplus-common.sh, shared across the git-* tools:
+# require_git_repo() here.
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+source "$(cd -P "$(dirname "$_src")/.." && pwd)/lib/gitplus-common.sh"
+
+usage() {
+  cat <<'EOF'
+gp new — create a branch and switch to it (a thin wrapper around
+`git switch -c`; the point is Tab-completing a short name — see
+`gp new` in the zsh completion, if you've enabled it).
+
+Usage:
+  gp new <name>            create <name> from the current branch, switch to it
+  gp new -b <base> <name>  create <name> from <base> instead
+  gp new -h                show this help
+EOF
+}
+
+base=""
+name=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -b|--base) shift; base="${1:-}" ;;
+    -*) echo "gp new: unknown option '$1' (try -h)" >&2; exit 2 ;;
+    *) name="$1" ;;
+  esac
+  shift
+done
+
+[ -n "$name" ] || { echo "gp new: give it a branch name (try -h)" >&2; exit 2; }
+
+require_git_repo "gp new"
+
+if [ -n "$base" ]; then
+  git switch -c "$name" "$base"
+else
+  git switch -c "$name"
+fi

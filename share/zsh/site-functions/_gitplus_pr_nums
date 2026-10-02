@@ -1,0 +1,41 @@
+#autoload
+#
+# Open PRs as completion candidates for `git pr` — the value inserted is the
+# bare PR number; the display is "NUM -- title" with numbers right-aligned,
+# others' PRs additionally suffixed "(@author)". Yours are sorted first, then
+# everyone else's — so scrolling/scanning starts with what you're most likely
+# after. One tag/group ('open-prs', one 'Open PRs' header) — coloring (via
+# list-colors, see ~/.zshrc) differentiates ownership per line instead of a
+# second header, matching on the "(@" suffix. (Not escape codes embedded
+# here: zsh's completion list renderer shows literal bytes for ANSI codes put
+# directly in a -d string — confirmed, they don't render — whereas
+# list-colors is the actual supported, properly-rendered mechanism.)
+#
+# Checking out another person's PR is a core use of `git pr`, so both are
+# offered; naming/merging stays your call — `git pr merge --all` and the bare
+# `git pr` listing are scoped to you in the command itself.
+local -a prs
+prs=(${(f)"$(_gitplus_open_prs)"})
+(( $#prs )) || return
+local me; me="$(_gitplus_gh_login)"
+
+local -a mine_nums mine_descs other_nums other_descs
+local p num rest branch author title w=0
+for p in $prs; do num="${p%%$'\t'*}"; (( ${#num} > w )) && w=${#num}; done
+for p in $prs; do
+  num="${p%%$'\t'*}"; rest="${p#*$'\t'}"
+  branch="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+  author="${rest%%$'\t'*}"; title="${rest#*$'\t'}"
+  if [[ -z $me || $author == $me ]]; then
+    mine_nums+=("$num"); mine_descs+=("${(l:w:)num} -- ${title}")
+  else
+    other_nums+=("$num"); other_descs+=("${(l:w:)num} -- ${title}  (@${author})")
+  fi
+done
+
+local -a nums descs
+nums=("${mine_nums[@]}" "${other_nums[@]}")
+descs=("${mine_descs[@]}" "${other_descs[@]}")
+
+local expl
+_wanted open-prs expl 'Open PRs' compadd -d descs -a nums

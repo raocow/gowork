@@ -1,0 +1,42 @@
+.TH GP-HASPR 1 "2026-07-23" "gitplus" "gitplus Manual"
+.SH NAME
+gp-haspr \- check whether a branch already has a pull request
+.SH SYNOPSIS
+.B gp haspr
+.RI [ BRANCH ]
+.br
+.B gp haspr
+[\fB\-h\fR|\fB\-\-help\fR]
+.SH DESCRIPTION
+Check whether
+.I BRANCH
+(or the current branch, if none is given) already has a pull request, in any
+state \(em open, closed, or merged \(em so it also catches a PR that already
+landed or was closed, before you go create a duplicate.
+.PP
+If any PR exists for the branch, its URL and state are printed and the exit
+status is 0. Otherwise a clear message is printed and the exit status is 1,
+so it is usable in scripts:
+.BR "if gp haspr; then ...; fi" .
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Show usage and exit.
+.SH REQUIREMENTS
+Requires the GitHub CLI
+.RB ( gh ),
+authenticated for the repository
+.RB ( "gh auth login" ).
+.SH EXAMPLES
+.TP
+.B gp haspr
+Check the current branch.
+.TP
+.B gp haspr task/foo
+Check a specific branch.
+.TP
+.B gp haspr || gh pr create
+Open a PR only if this branch doesn't already have one.
+.SH SEE ALSO
+.BR gp-pr (1),
+.BR gh (1)

@@ -1,0 +1,59 @@
+.TH GP-NEW 1 "2026-07-23" "gitplus" "gitplus Manual"
+.SH NAME
+gp-new \- create a branch and switch to it
+.SH SYNOPSIS
+.B gp new
+.I NAME
+.br
+.B gp new
+[\fB\-b\fR|\fB\-\-base\fR \fIBASE\fR]
+.I NAME
+.br
+.B gp new
+[\fB\-h\fR|\fB\-\-help\fR]
+.SH DESCRIPTION
+A thin wrapper around
+.BR "git switch \-c" :
+create branch
+.I NAME
+and switch to it, from the current branch by default, or from
+.I BASE
+if
+.B \-b
+is given.
+.PP
+Its real point is Tab-completion, not the wrapping: with the gitplus zsh
+completions enabled,
+.B "gp new"
+cycles through short words already used in this repository's existing branch
+names (via
+.BR _multi_parts ),
+so composing a short name takes a few Tab presses instead of typing a
+sentence \(em and it works no matter what is driving the terminal (an agent, a
+script, you by hand), since the completion fires on the shell command itself,
+not on anything choosing to cooperate. See the
+.I README
+for enabling the completions.
+.SH OPTIONS
+.TP
+.BR \-b ", " \-\-base " " \fIBASE\fR
+Branch from
+.I BASE
+instead of the current branch.
+.TP
+.BR \-h ", " \-\-help
+Show usage and exit.
+.SH EXAMPLES
+.TP
+.B gp new fix-md-crash
+Create and switch to
+.IR fix-md-crash ,
+branching from the current branch.
+.TP
+.B gp new \-b main hotfix-timeout
+Create and switch to
+.IR hotfix-timeout ,
+branching from
+.IR main .
+.SH SEE ALSO
+.BR git-switch (1)

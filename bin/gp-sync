@@ -1,0 +1,408 @@
+#!/usr/bin/env bash
+#
+# gp-sync — rebase branch(es) onto the latest base and push.
+#
+#   gp sync                    rebase the CURRENT branch onto origin's default,
+#                               then push --force-with-lease
+#   gp sync <n|branch|url>...  rebase the named branch(es) — a PR number, a head
+#                               branch, a URL, or an "NNN-MMM" range, all mixable
+#   gp sync --all              prune merged branches + rebase/push all the rest [-a]
+#   gp sync ... -x <ids...>    exclude branch(es)/PR(s) from any form  [--exclude]
+#   gp sync -b NAME            use origin/NAME as the base instead
+#   gp sync -n                 dry run — print what it would do, change nothing
+#
+# The positional/exclude grammar mirrors `gp pr merge`: targets may be a PR
+# number, a head-branch name, a PR URL, or an "NNN-MMM" range (a token is a range
+# only if it's ENTIRELY digits-hyphen-digits, so "task-42" passes through), all
+# mixable; -x/--exclude takes the same forms (ranges included) and consumes every
+# token after it until the next flag. A numeric or URL target is resolved to its
+# PR's head branch via `gh`; a plain branch name is used as-is with no network,
+# so naming branches directly still works offline.
+#
+# On the base branch — or when a named target IS the base — it acts as a safe
+# pull: fetch → rebase origin/<base> (fast-forwards when only behind), never a
+# push (you don't force-push the base).
+#
+# When a rebase cannot be completed automatically it reacts exactly like
+# `gp pr merge`: it ABORTS the rebase (the branch is left untouched, never half
+# rebased), skips that branch, and lists it at the end as needing manual
+# resolution — it never drops you into a conflicted rebase and never fails the
+# whole run. Resolve one by hand with:
+#     git checkout <branch> && git rebase origin/<base>
+#
+# force-with-lease is used for the push (a rebase rewrites history; the lease
+# still refuses to clobber remote commits you haven't pulled). A branch you name
+# explicitly gets its remote created on first push; the --all sweep never creates
+# a remote for a purely-local branch (it reports those as rebased-local-only).
+# Squash-merged branches aren't detected as merged, so --all rebases rather than
+# prunes them — delete those yourself (or `gp sweep -f`).
+#
+# (There is no --method: unlike `gp pr merge`, sync only ever rebases — there's
+# no merge-commit/squash choice to make.)
+#
+# Usage:
+#   gp sync                        rebase the current branch onto origin's default, push
+#                                   (on the base branch: pull it — fetch + rebase, no push)
+#   gp sync <n|branch|range>...    rebase the given branch(es); "824-830" is a range
+#   gp sync --all                  prune merged branches + rebase/push all the rest (-a)
+#   gp sync ... -x <ids...>        exclude branch(es)/PR(s) (--exclude; also takes ranges)
+#   gp sync -b NAME                use origin/NAME as the base instead
+#   gp sync -n                     dry run — print what it would do, change nothing
+#   gp sync -h                     show this help
+#
+set -euo pipefail
+
+# Resolve this script's real location (following symlinks — it's installed as
+# one) to find lib/gitplus-common.sh, shared across the git-* tools: the
+# color/step/warn helpers, resolve_base(), and expand_ranges().
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+source "$(cd -P "$(dirname "$_src")/.." && pwd)/lib/gitplus-common.sh"
+
+usage() {
+  cat <<'EOF'
+gp sync — rebase branch(es) onto the latest base and push.
+
+  gp sync                    rebase the CURRENT branch onto origin's default,
+                              then push --force-with-lease
+  gp sync <n|branch|url>...  rebase the named branch(es): a PR number, a head
+                              branch, a URL, or an "NNN-MMM" range — all mixable
+  gp sync --all              prune merged branches + rebase/push all the rest (-a)
+  gp sync ... -x <ids...>    exclude branch(es)/PR(s) from any form (--exclude;
+                              also takes ranges — everything after -x is excluded
+                              until the next flag)
+  gp sync -b NAME            use origin/NAME as the base instead
+  gp sync -n                 dry run — print what it would do, change nothing
+  gp sync -h                 show this help
+
+Targets mirror `gp pr merge`: a numeric/URL target is resolved to its PR's head
+branch via `gh`; a plain branch name is used as-is (offline-friendly).
+
+On the base branch (or a target that IS the base) it acts as a safe pull: fetch +
+rebase, no push. When a rebase can't complete automatically it reacts like
+`gp pr merge` — it aborts the rebase, skips that branch, and lists it at the end
+as needing manual resolution (never a half-finished rebase, never a failed run).
+Resolve one by hand with:  git checkout <branch> && git rebase origin/<base>
+EOF
+}
+
+dry=0
+all=0
+base=""
+raw_targets=()   # positional args before -x: ids and/or "NNN-MMM" ranges
+raw_excludes=()  # positional args after -x/--exclude
+in_exclude=0     # once -x is seen, bare tokens go to raw_excludes until another flag
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) dry=1; in_exclude=0 ;;
+    -a|--all) all=1; in_exclude=0 ;;
+    -b|--base) shift; base="${1:-}"; in_exclude=0 ;;
+    -x|--exclude) in_exclude=1 ;;
+    -*) echo "gp sync: unknown option '$1' (try -h)" >&2; exit 2 ;;
+    *)
+      if [ "$in_exclude" = 1 ]; then raw_excludes+=("$1"); else raw_targets+=("$1"); fi
+      ;;
+  esac
+  shift
+done
+
+if [ "$all" = 1 ] && [ "${#raw_targets[@]}" -gt 0 ]; then
+  echo "gp sync: can't combine --all with specific branches" >&2; exit 2
+fi
+
+require_git_repo "gp sync"
+
+current=$(git rev-parse --abbrev-ref HEAD)
+[ "$current" != "HEAD" ] || {
+  echo "gp sync: detached HEAD — check out a branch first" >&2; exit 1; }
+
+# Base = origin's default branch unless told otherwise (shared with
+# sweep/wsweep/done — this now also gets their main/master + current-branch
+# fallback, which this used to lack).
+base="$(resolve_base "$base")"
+
+# A rebase needs a clean tree; bail early with a clear message (every mode).
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "gp sync: you have uncommitted changes — commit or stash them first" >&2
+  exit 1
+fi
+
+# expand_ranges (shared, from lib/gitplus-common.sh) expands "NNN-MMM"
+# range tokens into individual ids — a token only counts as a range if it's
+# ENTIRELY digits-hyphen-digits, so a branch name like "task-42" passes
+# through untouched. Applied to both targets and excludes so -x accepts
+# ranges too.
+target_ids=();  [ "${#raw_targets[@]}"  -gt 0 ] && expand_ranges "gp sync" target_ids  ${raw_targets[@]+"${raw_targets[@]}"}
+exclude_ids=(); [ "${#raw_excludes[@]}" -gt 0 ] && expand_ranges "gp sync" exclude_ids ${raw_excludes[@]+"${raw_excludes[@]}"}
+
+# A numeric/URL token needs `gh` to become a branch; a plain name doesn't.
+needs_gh() { printf '%s' "$1" | grep -qE '^[0-9]+$|://'; }
+gh_required=0
+for t in ${target_ids[@]+"${target_ids[@]}"} ${exclude_ids[@]+"${exclude_ids[@]}"}; do
+  [ -n "$t" ] && needs_gh "$t" && { gh_required=1; break; }
+done
+if [ "$gh_required" = 1 ] && ! command -v gh >/dev/null 2>&1; then
+  echo "gp sync: a PR number or URL target needs the GitHub CLI ('gh') — name the branch instead, or install https://cli.github.com" >&2
+  exit 1
+fi
+
+# Resolve a target token to a branch name (empty if it can't be resolved). A PR
+# number or URL goes through `gh` to its head branch; a plain name is used as-is,
+# with a last-ditch fallback to a local branch literally named that token.
+resolve_target() {
+  local t="$1" b=""
+  if needs_gh "$t"; then
+    b="$(gh pr view "$t" --json headRefName --jq '.headRefName' 2>/dev/null || true)"
+    [ -z "$b" ] && git show-ref --verify --quiet "refs/heads/$t" && b="$t"
+  else
+    b="$t"
+  fi
+  printf '%s' "$b"
+}
+
+# Result buckets, filled by sync_one and printed at the end.
+synced=(); locals=(); uptodate=(); pulled=(); pruned=(); conflicts=(); skipped=()
+
+# Rebase <branch> onto origin/<base> and push it (unless it IS the base, which is
+# pulled, never pushed). create_remote=1 → create the origin branch on first push
+# when it has none; 0 → leave a purely-local branch alone. Appends the branch to
+# the matching bucket. Assumes a clean tree, that the fetch already ran, and that
+# we're free to move HEAD (the caller restores it).
+sync_one() {  # sync_one <branch> <create_remote 0|1>
+  local b="$1" create_remote="$2"
+
+  # Syncing means rebasing+pushing THIS branch, which normally happens by
+  # checking it out here. If it's already checked out in another worktree (a
+  # hard git rule — one worktree per branch), checking it out here is
+  # impossible, but the underlying work isn't: `git -C <dir>` runs every git
+  # command against that worktree directly, without touching this one or
+  # needing to actually be there. $dir is "." (here, needs an explicit
+  # checkout below) unless the branch already lives elsewhere, in which case
+  # it's already checked out there — no checkout step needed, just operate
+  # in place via $dir.
+  local dir="."
+  local wt
+  if wt="$(worktree_path_for_branch "$b")"; then
+    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+      skipped+=("$b (dirty in other worktree: $wt)"); return
+    fi
+    dir="$wt"
+  fi
+
+  # The base branch (or a target that is the base): a safe pull, never a push.
+  if [ "$b" = "$base" ]; then
+    git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$base" || { skipped+=("$b (no origin/$base)"); return; }
+    if [ "$dir" = "." ]; then
+      git checkout --quiet "$b" 2>/dev/null || { skipped+=("$b (checkout failed)"); return; }
+    fi
+    if [ "$(git -C "$dir" rev-parse HEAD)" = "$(git -C "$dir" rev-parse "refs/remotes/origin/$base")" ]; then uptodate+=("$b"); return; fi
+    if git -C "$dir" rebase "refs/remotes/origin/$base" >/dev/null 2>&1; then pulled+=("$b"); else
+      git -C "$dir" rebase --abort >/dev/null 2>&1 || true; conflicts+=("$b"); fi
+    return
+  fi
+
+  # A named target that isn't local yet but exists on origin → create a tracking
+  # branch so it can be rebased and pushed. Only applies here ($dir is "."): a
+  # branch found in another worktree already exists locally by definition.
+  if [ "$dir" = "." ]; then
+    if git show-ref --verify --quiet "refs/heads/$b"; then
+      git checkout --quiet "$b" 2>/dev/null || { skipped+=("$b (checkout failed)"); return; }
+    elif git show-ref --verify --quiet "refs/remotes/origin/$b"; then
+      git checkout --quiet -B "$b" --track "origin/$b" >/dev/null 2>&1 \
+        || { skipped+=("$b (couldn't create from origin/$b)"); return; }
+    else
+      skipped+=("$b (no such local or origin branch)"); return
+    fi
+  fi
+
+  # The reaction gp pr merge has when a rebase can't finish: abort it (leave the
+  # branch exactly as it was), and record it for the "conflicts" report — never a
+  # half-finished rebase left in the tree.
+  if ! git -C "$dir" rebase "refs/remotes/origin/$base" >/dev/null 2>&1; then
+    git -C "$dir" rebase --abort >/dev/null 2>&1 || true
+    conflicts+=("$b"); return
+  fi
+
+  # Push. force-with-lease once there's a remote to lease against; -u to create
+  # the remote on first push when allowed (create_remote); otherwise a purely
+  # local branch is left as-is (never auto-published by a sweep).
+  if git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 \
+     || git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$b"; then
+    if git -C "$dir" push --force-with-lease --force-if-includes origin "$b" >/dev/null 2>&1; then
+      synced+=("$b")
+    else
+      skipped+=("$b (push refused — protected branch or lost lease)")
+    fi
+  elif [ "$create_remote" = 1 ]; then
+    if git -C "$dir" push -u origin "$b" >/dev/null 2>&1; then synced+=("$b"); else skipped+=("$b (push failed)"); fi
+  else
+    locals+=("$b")
+  fi
+}
+
+# Print a labelled list, but only if it's non-empty (bash 3.2 safe).
+_report() {
+  label="$1"; shift
+  [ "$#" -eq 0 ] && return 0
+  printf '%s%s:%s\n' "$_dim" "$label" "$_off"
+  for b in "$@"; do echo "  $b"; done
+}
+
+# The multi-branch summary (--all, or more than one target).
+report_summary() {
+  echo
+  _report "Synced (rebased + pushed)"   ${synced[@]+"${synced[@]}"}
+  _report "Pulled (base)"               ${pulled[@]+"${pulled[@]}"}
+  _report "Up to date"                  ${uptodate[@]+"${uptodate[@]}"}
+  _report "Rebased (local only)"        ${locals[@]+"${locals[@]}"}
+  _report "Pruned (merged)"             ${pruned[@]+"${pruned[@]}"}
+  _report "Conflicts — needs manual resolution" ${conflicts[@]+"${conflicts[@]}"}
+  _report "Skipped"                     ${skipped[@]+"${skipped[@]}"}
+  if [ "${#conflicts[@]}" -gt 0 ]; then
+    echo
+    warn "for each conflict: git checkout <branch> && git rebase origin/$base"
+  fi
+}
+
+# The one-liner for the everyday single-branch run (default, or one named target).
+report_one() {
+  if   [ "${#synced[@]}"    = 1 ]; then step "synced ${synced[0]} ${_dim}(rebased onto origin/$base, pushed)${_off}"
+  elif [ "${#pulled[@]}"    = 1 ]; then step "pulled ${pulled[0]} ${_dim}(rebased onto origin/$base, local only — not pushed)${_off}"
+  elif [ "${#uptodate[@]}"  = 1 ]; then step "${uptodate[0]} already up to date with origin/$base"
+  elif [ "${#locals[@]}"    = 1 ]; then step "rebased ${locals[0]} ${_dim}(onto origin/$base, local only — not pushed)${_off}"
+  elif [ "${#pruned[@]}"    = 1 ]; then step "pruned ${pruned[0]} ${_dim}(merged)${_off}"
+  elif [ "${#conflicts[@]}" = 1 ]; then warn "rebase conflicts on ${conflicts[0]} — aborted, untouched. Resolve by hand: git checkout ${conflicts[0]} && git rebase origin/$base"
+  elif [ "${#skipped[@]}"   = 1 ]; then warn "skipped ${skipped[0]}"
+  fi
+}
+
+start="$current"
+
+# ══════════════════════════════════════════════════════════════════════════
+# Dry run — compute and print the plan, change nothing.
+# ══════════════════════════════════════════════════════════════════════════
+if [ "$dry" = 1 ]; then
+  git fetch origin --prune
+  echo
+  excl=" "
+  for x in ${exclude_ids[@]+"${exclude_ids[@]}"}; do [ -n "$x" ] && { xb="$(resolve_target "$x")"; [ -n "$xb" ] && excl="$excl$xb "; }; done
+  echo "Against 'origin/$base', would:"
+  if [ "$all" = 1 ]; then
+    while IFS= read -r b; do
+      [ "$b" = "$base" ] && continue
+      case "$excl" in *" $b "*) echo "  skip (excluded): $b"; continue ;; esac
+      if git merge-base --is-ancestor "$b" "refs/remotes/origin/$base" 2>/dev/null; then
+        echo "  prune (merged):  $b"
+      else
+        echo "  rebase + push:   $b"
+      fi
+    done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+  else
+    plan_branches=()
+    if [ "${#target_ids[@]}" -gt 0 ]; then
+      for t in ${target_ids[@]+"${target_ids[@]}"}; do
+        b="$(resolve_target "$t")"
+        [ -z "$b" ] && { echo "  skip (unresolved): $t"; continue; }
+        plan_branches+=("$b")
+      done
+    else
+      plan_branches=("$current")
+    fi
+    for b in ${plan_branches[@]+"${plan_branches[@]}"}; do
+      case "$excl" in *" $b "*) echo "  skip (excluded): $b"; continue ;; esac
+      if [ "$b" = "$base" ]; then echo "  pull (no push):  $b"; else echo "  rebase + push:   $b"; fi
+    done
+  fi
+  echo
+  echo "Run without --dry-run to actually sync."
+  exit 0
+fi
+
+git fetch --quiet origin --prune
+
+# Resolve the excludes to a space-padded set of branch names for membership tests.
+exclude_set=" "
+for x in ${exclude_ids[@]+"${exclude_ids[@]}"}; do
+  [ -z "$x" ] && continue
+  xb="$(resolve_target "$x")"; [ -n "$xb" ] && exclude_set="$exclude_set$xb "
+done
+is_excluded() { case "$exclude_set" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+# ══════════════════════════════════════════════════════════════════════════
+# --all: prune merged branches, rebase/push the rest (a broad sweep — never
+# creates a remote for a purely-local branch).
+# ══════════════════════════════════════════════════════════════════════════
+if [ "$all" = 1 ]; then
+  # Fast-forward local base to the remote tip so the merged-check (and the
+  # eventual `branch -d`) sees current state. Best effort — skip if diverged.
+  if [ "$current" != "$base" ]; then git checkout --quiet "$base" 2>/dev/null || true; fi
+  git merge --ff-only "refs/remotes/origin/$base" >/dev/null 2>&1 \
+    || echo "note: local '$base' didn't fast-forward (diverged?) — continuing." >&2
+
+  while IFS= read -r b; do
+    [ "$b" = "$base" ] && continue
+    if is_excluded "$b"; then skipped+=("$b (excluded)"); continue; fi
+    if git merge-base --is-ancestor "$b" "refs/remotes/origin/$base" 2>/dev/null; then
+      # `git branch -d` refuses a branch checked out in another worktree too
+      # (same underlying rule) — worth naming up front rather than a vague
+      # "(couldn't delete)" for something that was never going to work.
+      if wt="$(worktree_path_for_branch "$b")"; then
+        skipped+=("$b (merged, but checked out in another worktree: $wt)"); continue
+      fi
+      if git branch -d "$b" >/dev/null 2>&1; then pruned+=("$b"); else skipped+=("$b (couldn't delete)"); fi
+      continue
+    fi
+    sync_one "$b" 0
+  done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+
+  # Return to where we started (or the base if that branch got pruned).
+  if git show-ref --verify --quiet "refs/heads/$start"; then
+    git checkout --quiet "$start"
+  else
+    git checkout --quiet "$base"
+  fi
+  report_summary
+  exit 0
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# Explicit targets, or (with none) the current branch.
+# ══════════════════════════════════════════════════════════════════════════
+branches=()
+if [ "${#target_ids[@]}" -gt 0 ]; then
+  seen=" "
+  for t in ${target_ids[@]+"${target_ids[@]}"}; do
+    b="$(resolve_target "$t")"
+    if [ -z "$b" ]; then skipped+=("$t (couldn't resolve to a branch)"); continue; fi
+    case "$seen" in *" $b "*) continue ;; esac
+    seen="$seen$b "
+    if is_excluded "$b"; then skipped+=("$b (excluded)"); continue; fi
+    branches+=("$b")
+  done
+else
+  if is_excluded "$current"; then
+    warn "current branch '$current' is excluded — nothing to do"; exit 0
+  fi
+  branches=("$current")
+fi
+
+for b in ${branches[@]+"${branches[@]}"}; do
+  sync_one "$b" 1
+done
+
+# Return to where we started if we moved off it (a named target isn't the
+# current branch; the base-ff/prune path can also move HEAD).
+if [ "$(git rev-parse --abbrev-ref HEAD)" != "$start" ] && git show-ref --verify --quiet "refs/heads/$start"; then
+  git checkout --quiet "$start"
+fi
+
+# One acted branch → the familiar one-liner; more than one → the full summary.
+acted=$(( ${#synced[@]} + ${#pulled[@]} + ${#uptodate[@]} + ${#locals[@]} + ${#pruned[@]} + ${#conflicts[@]} + ${#skipped[@]} ))
+if [ "$acted" = 1 ]; then report_one; else report_summary; fi
+exit 0

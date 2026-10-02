@@ -1,0 +1,8 @@
+#autoload
+#
+# Your GitHub login (viewer), cached by _gitplus_open_prs' background refresh in
+# the shared completion-cache dir. Pure read — echoes nothing until the first
+# refresh has populated it (in which case _gitplus_pr_nums just can't split
+# yours-vs-others yet, and shows them ungrouped for that first Tab).
+local dir="${TMPDIR:-/tmp}/gitplus-comp"
+[[ -f "$dir/gh-login" ]] && cat "$dir/gh-login"

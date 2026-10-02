@@ -1,0 +1,41 @@
+#autoload
+#
+# Completion for `gp pr` (list / checkout / merge). Candidates are real open
+# PRs (shown with their titles) and real branches — nothing generated or
+# guessed. '.'/'@' (the current branch) is offered everywhere an id is
+# accepted. Flags are only offered once you type a leading '-', so a bare TAB
+# is PRs-first instead of a wall of options.
+local -a alts
+# These are all repo-scoped (PRs, branches, the current branch). Outside a
+# repo there's nothing meaningful to offer — say so, rather than dangling a
+# misleading ./@ that couldn't resolve to anything anyway.
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  _message -r 'not inside a git repository'
+  return
+fi
+if (( CURRENT == 2 )); then
+  alts=('subcommands:Subcommand:(merge list)' 'current:Current branch:(. @)' 'ids:PR:_gitplus_pr_nums')
+  [[ $PREFIX == -* ]] && alts+=('flags:Flag:(-h --help -nt --no-title -a --all -x --exclude)')
+  _alternative $alts
+  return
+fi
+if [[ ${words[2]} == merge ]]; then
+  case ${words[CURRENT-1]} in
+    --method) compadd merge squash rebase; return ;;
+    -x|--exclude)
+      _alternative 'current:Current branch:(. @)' 'ids:PR:_gitplus_pr_nums'; return ;;
+  esac
+  alts=('current:Current branch:(. @)' 'ids:PR or NNN-MMM range:_gitplus_pr_nums')
+  [[ $PREFIX == -* ]] && alts+=('flags:Flag:(-a --all -x --exclude -n --dry-run --method -h --help)')
+  _alternative $alts
+  return
+fi
+# Bare (no subcommand) or `list` share the same grammar: ids/ranges, -a/--all,
+# -x/--exclude.
+case ${words[CURRENT-1]} in
+  -x|--exclude)
+    _alternative 'current:Current branch:(. @)' 'ids:PR:_gitplus_pr_nums'; return ;;
+esac
+alts=('current:Current branch:(. @)' 'ids:PR:_gitplus_pr_nums')
+[[ $PREFIX == -* ]] && alts+=('flags:Flag:(-h --help -nt --no-title -a --all -x --exclude)')
+_alternative $alts

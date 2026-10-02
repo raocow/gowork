@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+#
+# gp-wsweep — remove worktrees whose HEAD is already merged into the base.
+#
+# The worktree analogue of `gp sweep`. Removes merged *worktrees* — the linked
+# working directories — AND deletes the underlying branch, same as running
+# `gp sweep` right after: you're almost always done with both at once, so this
+# saves the two-step. (A detached-HEAD worktree has no branch to delete.)
+#
+# Like gp-sweep, it fetches first and judges "merged" against the base's REMOTE
+# tip (origin/<base>), so it works without pulling the base and from any
+# worktree. Safe by default: a BRANCH-backed worktree (and its branch) is
+# removed only when its HEAD is already an ancestor of the base's remote tip
+# (verified with `git merge-base --is-ancestor`), so no unmerged work is lost.
+# A DETACHED-HEAD worktree skips that check and is always removed in safe mode
+# too — it holds no branch, so there's no unmerged-branch risk to protect
+# against, just an abandoned checkout location (commonly left behind by
+# `gp switch` freeing a branch from it). Still protected against surprise data
+# loss: `git worktree remove` (without --force) refuses on its own if the
+# worktree is dirty, so uncommitted changes there are never silently dropped —
+# only a clean, abandoned detached checkout goes. The branch delete uses `-D`
+# rather than `-d` on purpose — same reasoning as gp-sweep: `-d` rechecks
+# mergedness against your *current* branch, which wrongly refuses a branch
+# merged upstream when local base is stale; we've already verified it
+# ourselves against the remote tip. The main worktree and the worktree you're
+# currently in are never touched (or deleted).
+#
+# --force widens the net to EVERY other worktree regardless of merge status and
+# removes with `git worktree remove --force`, so it also drops worktrees that
+# have uncommitted changes (discarding those changes). Branches are NOT deleted
+# in force mode — that's two separately-destructive actions to compound into
+# one flag; run `gp sweep -f` afterwards if you want those gone too. Preview
+# with -n first.
+#
+# Usage:
+#   gp wsweep           remove worktrees (and their branches) merged into the base
+#   gp wsweep -f        force: remove every worktree except main + current (keeps branches)
+#   gp wsweep -n        dry run — list what would be removed, change nothing
+#   gp wsweep -b NAME   base branch to compare against (default: origin's default)
+#   gp wsweep -h        show this help
+#
+set -euo pipefail
+
+# Resolve this script's real location (following symlinks — it's installed as
+# one) to find lib/gitplus-common.sh, shared across the git-* tools: the
+# color/step/warn helpers and resolve_base().
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+source "$(cd -P "$(dirname "$_src")/.." && pwd)/lib/gitplus-common.sh"
+
+usage() {
+  cat <<'EOF'
+gp wsweep — remove worktrees (and their branches) merged into the base.
+
+The worktree analogue of `gp sweep`: removes merged worktrees (the working
+directories) AND deletes the underlying branch, same as running `gp sweep`
+right after — you're almost always done with both at once. A detached-HEAD
+worktree has no branch, so only the worktree goes.
+
+Safe by default: a branch-backed worktree (and its branch) is removed only
+when its HEAD is already an ancestor of the base's remote tip (verified with
+merge-base), judged against origin/<base> after a fetch — so it works without
+pulling the base and never drops unmerged work. A detached-HEAD worktree
+skips that check and is always removed too (still refused by git itself if
+it's dirty, so uncommitted changes are never silently lost). The main
+worktree and the one you're currently in are never touched (or deleted).
+
+--force removes EVERY other worktree regardless of merge status, with
+`git worktree remove --force` — so it also drops worktrees with uncommitted
+changes (discarding those changes). Branches are NOT deleted in force mode —
+run `gp sweep -f` afterwards if you want those gone too. Run with -n first.
+
+Usage:
+  gp wsweep         remove worktrees + branches merged into the base (safe)
+  gp wsweep -f      force: remove every worktree except main + current (keeps branches)
+  gp wsweep -n      dry run — list what would be removed, change nothing
+  gp wsweep -b NAME base branch to compare against (default: origin's default)
+  gp wsweep -h      show this help
+
+  -f and -n combine: `gp wsweep -f -n` previews the force sweep.
+EOF
+}
+
+dry=0
+force=0
+base=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run) dry=1 ;;
+    -f|--force) force=1 ;;
+    -b|--base) shift; base="${1:-}" ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "gp wsweep: unknown option '$1' (try -h)" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+require_git_repo "gp wsweep"
+
+# Refresh remote-tracking refs first (best effort; ignore offline failures) so
+# "merged" is judged against origin's current tip — mirrors gp-sweep, so a
+# worktree on a branch merged upstream is swept even if local <base> is stale.
+git fetch --prune --quiet 2>/dev/null || true
+
+# Choose a base branch NAME if none given: origin's default, else main/master,
+# else the current branch. (Shared with gp-sweep.)
+base="$(resolve_base "$base")"
+
+if git show-ref --verify --quiet "refs/remotes/origin/$base"; then
+  mergeref="refs/remotes/origin/$base"
+  mergeref_display="origin/$base"
+elif git show-ref --verify --quiet "refs/heads/$base"; then
+  mergeref="$base"
+  mergeref_display="$base"
+else
+  echo "gp wsweep: base '$base' not found locally or on origin" >&2; exit 1
+fi
+
+# Branches whose PR was squash- or rebase-merged into the base (directly or
+# through a stack). Same reason gp-sweep needs this: a squash makes one new
+# commit and a rebase rewrites them all, so the ancestor test below says NO for
+# work that has fully landed — and in a squash-merging repo that means a safe
+# wsweep could never remove a single worktree. One API call for the whole repo;
+# empty offline or without gh, which falls back to the ancestor test alone.
+squashed=" "
+if [ "$force" = 0 ]; then
+  while IFS= read -r _h; do
+    [ -n "$_h" ] && squashed="$squashed$_h "
+  done <<EOF
+$(merged_pr_heads_into "$base")
+EOF
+fi
+is_squash_merged() { case "$squashed" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+# The main worktree is always listed first by `git worktree list --porcelain`;
+# never remove it. Never remove the worktree we're currently in either.
+main_wt=$(git worktree list --porcelain | sed -n 's/^worktree //p' | head -1)
+cur_wt=$(git rev-parse --show-toplevel)
+
+# Walk the porcelain records (blank-line separated). Judge each worktree by its
+# HEAD commit's reachability from $mergeref, which covers both branch-backed and
+# detached worktrees (a merged detached HEAD is still safe to drop).
+targets=()   # worktree paths to remove
+labels=()    # human label per target
+tbranches=() # branch name per target (empty = detached, nothing to delete)
+skipped=""   # unmerged worktrees skipped in safe mode
+path=""; branch=""; head=""
+
+consider() {
+  [ -z "$path" ] && return
+  # Never the main or the current worktree.
+  if [ "$path" = "$main_wt" ] || [ "$path" = "$cur_wt" ]; then return; fi
+  local label
+  if [ -n "$branch" ]; then label="$path [$branch]"; else label="$path [detached]"; fi
+  if [ "$force" = 1 ]; then
+    targets+=("$path"); labels+=("$label"); tbranches+=("$branch")
+  elif [ -z "$branch" ]; then
+    # Detached worktrees hold no branch, so there's no "unmerged branch"
+    # for the check below to be protecting — just an abandoned checkout
+    # location, commonly left behind by `gp switch` freeing a branch from
+    # here. Removed unconditionally in safe mode too, not just -f: still
+    # subject to git's own refusal to remove a DIRTY worktree without
+    # --force (below), so uncommitted changes sitting there are never
+    # silently discarded — only an abandoned, clean detached checkout is.
+    targets+=("$path"); labels+=("$label"); tbranches+=("$branch")
+  elif [ -n "$head" ] && git merge-base --is-ancestor "$head" "$mergeref" 2>/dev/null; then
+    targets+=("$path"); labels+=("$label"); tbranches+=("$branch")
+  elif is_squash_merged "$branch"; then
+    targets+=("$path"); labels+=("$label"); tbranches+=("$branch")
+  else
+    skipped="${skipped}  ${label} (not merged into ${mergeref_display})"$'\n'
+  fi
+}
+
+while IFS= read -r line; do
+  case "$line" in
+    "worktree "*) consider; path="${line#worktree }"; branch=""; head="" ;;
+    "HEAD "*)     head="${line#HEAD }" ;;
+    "branch "*)   branch="${line#branch refs/heads/}" ;;
+    "detached")   branch="" ;;
+  esac
+done < <(git worktree list --porcelain)
+consider
+
+if [ ${#targets[@]} -eq 0 ]; then
+  if [ "$force" = 1 ]; then
+    echo "gp wsweep: no other worktrees to remove."
+  else
+    echo "gp wsweep: no merged worktrees to remove."
+  fi
+  [ -n "$skipped" ] && { echo "Skipped (unmerged; use -f to force):"; printf '%s' "$skipped"; }
+  exit 0
+fi
+
+if [ "$dry" = 1 ]; then
+  if [ "$force" = 1 ]; then
+    echo "Would remove (every worktree except main + current; branches kept):"
+  else
+    echo "Would remove (merged into '$mergeref_display', or detached) and delete the branch where there is one:"
+  fi
+  for l in ${labels[@]+"${labels[@]}"}; do echo "  $l"; done
+  [ -n "$skipped" ] && { echo "Skipped (unmerged):"; printf '%s' "$skipped"; }
+  exit 0
+fi
+
+# Note: build the command per-branch rather than expanding a possibly-empty
+# flag array — `${arr[@]+"${arr[@]}"}` on an empty array trips `set -u` on bash 3.2 (macOS).
+for i in "${!targets[@]}"; do
+  if [ "$force" = 1 ]; then
+    ok=1; git worktree remove --force "${targets[$i]}" 2>/dev/null || ok=0
+  else
+    ok=1; git worktree remove "${targets[$i]}" 2>/dev/null || ok=0
+  fi
+  if [ "$ok" = 1 ]; then
+    step "removed ${labels[$i]}"
+    # Safe mode already verified this branch's tip is an ancestor of $mergeref
+    # (the same check gp-sweep uses) — delete it too, same as running
+    # gp sweep right after. -D, not -d: -d rechecks mergedness against the
+    # *current* branch, which can wrongly refuse when local base is stale;
+    # we trust our own already-done verification instead (same reasoning as
+    # gp-sweep). Force mode leaves branches alone — see the header comment.
+    if [ "$force" = 0 ] && [ -n "${tbranches[$i]}" ]; then
+      if git branch -D "${tbranches[$i]}" >/dev/null 2>&1; then
+        step "deleted ${tbranches[$i]}"
+      else
+        warn "couldn't delete branch ${tbranches[$i]}"
+      fi
+    fi
+  else
+    warn "couldn't remove ${targets[$i]} — uncommitted changes? use -f"
+  fi
+done
+git worktree prune
+[ -n "$skipped" ] && { echo "Skipped (unmerged; use -f to force):"; printf '%s' "$skipped"; }

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+BIN_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
+
+usage() {
+  cat <<'HELP'
+gp (gitplus) — personal git tooling
+
+Usage: gp <command> [args...]
+
+Commands:
+  pr          GitHub pull requests (list, checkout, merge, close, unmerge)
+  sweep       delete merged branches (local and/or remote)
+  done        finish: merge-base check, push, delete branch
+  sync        rebase branches onto their base
+  switch      everything `git switch` does, plus worktree/PR-aware resolution
+  new         create a branch and switch to it
+  release     tag and publish a GitHub release
+  account     manage per-directory git/ssh/GitHub identities
+  haspr       check whether a branch has an open PR
+  wsweep      delete worktrees whose branches are gone
+
+Shorthands:
+  pl          = gp pr list
+  pm          = gp pr merge
+
+  gp help     show this help
+  gp version  print the installed version
+HELP
+}
+
+cmd="${1:-help}"
+shift 2>/dev/null || true
+
+# Shorthands for the handful of things typed often enough that the subcommand
+# is pure friction. Expanded into <command> + leading args here, BEFORE the
+# dispatch below, so a shorthand resolves through exactly the same lookup as
+# the command it stands for — no duplicated gp-* resolution to drift, and the
+# rest of the arguments pass through untouched (`gp pl -a`, `gp pl 12 13`).
+case "$cmd" in
+  pl) cmd=pr; set -- list ${1+"$@"} ;;
+  pm) cmd=pr; set -- merge ${1+"$@"} ;;
+esac
+
+case "$cmd" in
+  help|--help|-h)       usage ;;
+  version|--version|-v)
+    if [ -f "$BIN_DIR/../.git/HEAD" ]; then
+      echo "gp $(git -C "$BIN_DIR/.." describe --tags --always 2>/dev/null || echo dev)"
+    else
+      v="$(brew info --json=v2 gitplus 2>/dev/null | sed -n 's/.*"installed":\[{"version":"\([^"]*\)".*/\1/p')"
+      echo "gp ${v:-unknown}"
+    fi ;;
+  *)
+    if [ -x "$BIN_DIR/gp-$cmd" ]; then
+      exec "$BIN_DIR/gp-$cmd" "$@"
+    elif command -v "gp-$cmd" >/dev/null 2>&1; then
+      exec "gp-$cmd" "$@"
+    elif git help "$cmd" >/dev/null 2>&1; then
+      exec git "$cmd" "$@"
+    else
+      echo "gp: unknown command '$cmd' (try: gp help)" >&2; exit 1
+    fi ;;
+esac

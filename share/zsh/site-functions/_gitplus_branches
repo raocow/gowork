@@ -1,0 +1,8 @@
+#autoload
+#
+# Local + remote branch short names, deduped, excluding HEAD/detached markers.
+# Shared helper for the gitplus completion functions — real data only,
+# nothing generated or guessed, same principle as `cd` completing real
+# directories.
+git for-each-ref --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null \
+  | sed 's#^origin/##' | grep -v '^HEAD$' | sort -u

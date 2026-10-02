@@ -1,0 +1,102 @@
+.TH GP-WSWEEP 1 "2026-07-09" "gitplus" "gitplus Manual"
+.SH NAME
+gp-wsweep \- remove worktrees (and their branches) merged into the base, or detached
+.SH SYNOPSIS
+.B gp wsweep
+[\fB\-f\fR|\fB\-\-force\fR]
+[\fB\-b\fR|\fB\-\-base\fR \fINAME\fR]
+[\fB\-n\fR|\fB\-\-dry\-run\fR]
+[\fB\-h\fR|\fB\-\-help\fR]
+.SH DESCRIPTION
+The worktree analogue of
+.BR gp-sweep (1).
+Removes merged
+.I worktrees
+\(em the linked working directories \(em
+.B and
+deletes the underlying branch, same as running
+.BR gp-sweep (1)
+right afterward \(em you are almost always done with both at once. A
+detached-HEAD worktree has no branch, so only the worktree goes.
+.PP
+Like gp-sweep, it fetches first and judges "merged" against the base's remote
+tip
+.RI ( origin/<base> ),
+so it works without pulling the base locally and from any worktree.
+.PP
+Safe by default: a
+.I branch-backed
+worktree (and its branch) is removed only when its HEAD is already an
+ancestor of the base's remote tip (verified with
+.BR "git merge-base \-\-is-ancestor" ),
+so no unmerged work is lost. Squash- and rebase-merged branches are caught
+too, directly or through a stack: when the ancestor test says no, every
+merged PR's head/base pair is fetched once and closed over locally to see
+whether the branch's PR reaches the base through a chain of merges (needs
+.BR gh ;
+offline it falls back to the ancestor test alone).
+.PP
+A
+.I detached-HEAD
+worktree skips both of those checks and is removed unconditionally in safe
+mode too \(em it holds no branch, so there is no unmerged-branch risk to
+protect against, just an abandoned checkout location (commonly left behind by
+.BR gp-switch (1)
+freeing a branch from it). Still protected against surprise data loss:
+.B "git worktree remove"
+(without
+.BR \-\-force )
+refuses on its own if the worktree is dirty, so uncommitted changes there are
+never silently dropped \(em only a clean, abandoned detached checkout goes.
+.PP
+The branch delete uses
+.B \-D
+rather than
+.B \-d
+on purpose, same reasoning as
+.BR gp-sweep (1):
+.B \-d
+rechecks mergedness against your
+.I current
+branch, which wrongly refuses a branch merged upstream when your local base is
+stale; the checks above are done instead, and trusted. The main worktree
+(always listed first) and the worktree you are currently in are never touched
+or deleted.
+.SH OPTIONS
+.TP
+.BR \-f ", " \-\-force
+Remove every worktree except the main one and the current one, regardless of
+merge status, with
+.BR "git worktree remove \-\-force" .
+This also drops worktrees that have uncommitted changes, discarding those
+changes.
+.B Branches are not deleted in force mode
+\(em that would compound two separately destructive actions into one flag; run
+.B gp sweep \-f
+afterward if you want those gone too.
+.B "It discards uncommitted work"
+\(em preview with
+.B \-n
+first.
+.TP
+.BR \-b ", " \-\-base " " \fINAME\fR
+Base branch to compare against instead of origin's default.
+.TP
+.BR \-n ", " \-\-dry\-run
+List what would be removed without changing anything.
+.TP
+.BR \-h ", " \-\-help
+Show usage and exit.
+.SH EXAMPLES
+.TP
+.B gp wsweep
+Remove worktrees (and their branches) whose HEAD is merged into the base (safe).
+.TP
+.B gp wsweep \-f \-n
+Preview a force sweep of every worktree except main and current.
+.SH SEE ALSO
+.BR gp-sweep (1),
+.BR gp-sync (1),
+.BR gp-pr (1),
+.BR gp-done (1),
+.BR git-worktree (1)

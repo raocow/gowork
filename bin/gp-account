@@ -1,0 +1,978 @@
+#!/usr/bin/env bash
+#
+# gp-account — tie directories to different git/ssh/GitHub identities.
+#
+# Work split across more than one GitHub account — a personal one and an
+# employer's — normally means remembering to set user.email per clone and
+# juggling ssh keys by hand. Set an account up once and every repo under a
+# bound directory commits as it, reaches the host with its key, and (with
+# --gh-user) has `gh` talk to GitHub as it.
+#
+# Nothing is sourced into your shell: git reads `includeIf` out of your git
+# config and ssh reads the `Host` alias out of your ssh config on their own,
+# so this is persistent config plus a keypair. The one shell-level piece is
+# optional — see share/zsh/ghswitch.zsh, which keeps `gh`'s identity matched
+# to the directory you're standing in.
+#
+# Usage:
+#   gp account add <name> --email <email> [--name <git name>]
+#                          [--host <host>] [--dir <path>] [--gh-user <user>]
+#   gp account bind <name> <dir>   use <name>'s identity in <dir> and below
+#   gp account unbind <name> <dir> drop a binding
+#   gp account sweep [--yes]       trace dead bindings: drop, rebind, or ask
+#   gp account list                accounts and their bound directories
+#   gp account key <name>          print the public key to paste into the host
+#   gp account register <name>     get the key onto GitHub, then route bound repos over ssh
+#   gp account check [--fix]       verify every binding and key still applies
+#
+# This lived in `devrig account` until gitplus grew a hard dependency on it:
+# every git-* command resolves the bound account before calling gh, so the
+# account registry belongs with the git tooling rather than a shell-helper
+# package. Config written by the old command is still read — see the sentinel
+# handling below — so existing setups keep working untouched.
+#
+set -euo pipefail
+
+# Resolve this script's real location (following symlinks — it's installed as
+# one) to find lib/gitplus-common.sh: step()/warn() and the color vars.
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+source "$(cd -P "$(dirname "$_src")/.." && pwd)/lib/gitplus-common.sh"
+
+usage() {
+  cat <<'EOF'
+gp account — tie directories to different git/ssh/GitHub identities.
+
+  gp account add <name> --email <email> [--name <git name>]
+                         [--host <host>] [--dir <path>] [--gh-user <user>]
+  gp account bind <name> <dir>   use <name>'s identity in <dir> and below
+  gp account unbind <name> <dir> drop a binding
+  gp account sweep [--yes]       trace bindings whose directory is gone: drop,
+                                 rebind where the repo moved, or ask
+  gp account list                accounts and their bound directories
+  gp account key <name>          print the public key to paste into the host
+  gp account register <name>     get <name>'s key accepted by GitHub (one browser
+                                 approval the first time), then route its bound
+                                 repos over ssh
+  gp account check [--fix]       verify every binding and key still applies;
+                                 --fix registers refused keys and turns routing on
+  gp account -h                  show this help
+
+Nothing is sourced into your shell — git reads includeIf and ssh reads the
+Host alias on their own. `check` is the one worth running: a renamed or moved
+directory leaves its includeIf pointing at a path that's gone, so git quietly
+falls back to your global identity and the wrong name lands on every commit.
+
+Overrides for testing: GITPLUS_SSH_CONFIG, GITPLUS_GITCONFIG,
+GITPLUS_SSH_KEY_DIR.
+EOF
+}
+
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+
+SSH_CONFIG="${GITPLUS_SSH_CONFIG:-${DEVRIG_SSH_CONFIG:-${EZENV_SSH_CONFIG:-$HOME/.ssh/config}}}"
+GITCONFIG="${GITPLUS_GITCONFIG:-${DEVRIG_GITCONFIG:-${EZENV_GITCONFIG:-$HOME/.gitconfig}}}"
+KEY_DIR="${GITPLUS_SSH_KEY_DIR:-${DEVRIG_SSH_KEY_DIR:-${EZENV_SSH_KEY_DIR:-$HOME/.ssh}}}"
+
+# The name lands in a filename, an ssh Host alias, and a config path, so keep it
+# to characters that are safe and quote-free in all three.
+_acct_valid_name() {
+  case "$1" in
+    ""|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  return 0
+}
+
+_acct_key()      { echo "$KEY_DIR/id_ed25519_$1"; }
+# Identity file sits beside the gitconfig it's included from, so an DEVRIG_GITCONFIG
+# override (tests) keeps the whole set together instead of writing into real $HOME.
+_acct_identity() { echo "$(dirname "$GITCONFIG")/.gitconfig-$1"; }
+
+# Readers accept BOTH sentinel prefixes. `devrig:` is what this code wrote
+# before it moved here, and those lines are sitting in people's live
+# ~/.ssh/config and ~/.gitconfig right now — refusing to read them would make
+# every existing account and binding silently vanish. New writes use
+# `gitplus:`; a file with a mix of both works fine.
+# Two separate expressions rather than one \(a\|b\) alternation: that is a GNU
+# sed extension, and BSD sed (what macOS ships) silently matches NOTHING for
+# it — which made every account and binding disappear rather than error.
+_acct_names() {  # every registered account, one per line
+  [ -f "$SSH_CONFIG" ] || return 0
+  sed -n 's/^# gitplus:account:\([^ ]*\) BEGIN.*/\1/p;s/^# devrig:account:\([^ ]*\) BEGIN.*/\1/p' "$SSH_CONFIG"
+}
+
+_acct_binds() {  # "<name> <dir>" per binding
+  [ -f "$GITCONFIG" ] || return 0
+  sed -n 's/^# gitplus:bind:\([^ ]*\) BEGIN \(.*\)$/\1 \2/p;s/^# devrig:bind:\([^ ]*\) BEGIN \(.*\)$/\1 \2/p' "$GITCONFIG"
+}
+
+_acct_ghuser() {  # gh CLI username recorded for an account, empty if none
+  [ -f "$SSH_CONFIG" ] || return 0
+  sed -n "s/^# gitplus:ghuser:$1 //p;s/^# devrig:ghuser:$1 //p" "$SSH_CONFIG"
+}
+
+# Internal (not in `devrig help`): the gh username to activate for a
+# directory — the NEAREST bound account (longest matching bound dir wins,
+# same "current directory is authoritative" rule as autovenv) that has a
+# --gh-user recorded, or nothing if outside every bound scope or the nearest
+# one has none. Used by the ghswitch shell feature; also handy to call by
+# hand when checking why a directory isn't switching.
+acct_gh_for_dir() {
+  local target="${1:-$PWD}" main
+  target="$(_acct_abspath "$target" 2>/dev/null)" || target="${1:-$PWD}"
+  if _acct_bound_name "$target" >/dev/null; then
+    _acct_ghuser "$(_acct_bound_name "$target")"
+    return 0
+  fi
+  # A linked worktree can live anywhere (~/code/wt-x, ~/.codex/worktrees/…)
+  # but belongs to its main repository, so fall back to where that is. git's
+  # own includeIf already behaves this way — a worktree's git dir is inside
+  # the main repo — and gh should agree with it.
+  main="$(git -C "$target" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+  case "$main" in */.git) main="${main%/.git}" ;; *) return 0 ;; esac
+  if _acct_bound_name "$main" >/dev/null; then
+    _acct_ghuser "$(_acct_bound_name "$main")"
+  fi
+  return 0
+}
+
+# _acct_bound_name <abs-dir> — the account whose bound directory is the
+# nearest one containing <abs-dir>; fails if none does.
+_acct_bound_name() {
+  local target="$1" best="" bestlen=-1 line n d
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    n="${line%% *}"; d="${line#* }"
+    case "$target" in
+      "$d"|"$d"/*)
+        [ "${#d}" -gt "$bestlen" ] && { best="$n"; bestlen="${#d}"; }
+        ;;
+    esac
+  done <<EOF
+$(_acct_binds)
+EOF
+  [ -n "$best" ] || return 1
+  echo "$best"
+}
+
+# _acct_repo_slug <dir> — "owner/repo" for <dir>'s origin remote, if it's a
+# GitHub one. Handles every remote form in practice: https, scp-style
+# git@host:owner/repo, ssh://, with or without a trailing .git — including
+# devrig's OWN `github.com-<account>` ssh aliases, which are still github.com.
+# Fails (returns 1, prints nothing) for a non-git dir, no origin, or a
+# non-GitHub host.
+_acct_repo_slug() {
+  local dir="${1:-$PWD}" url u host path
+  url="$(git -C "$dir" remote get-url origin 2>/dev/null)" || return 1
+  [ -n "$url" ] || return 1
+  u="${url#*://}"          # drop scheme if present
+  u="${u#*@}"              # drop user@ if present
+  host="${u%%[:/]*}"
+  path="${u#*[:/]}"
+  path="${path%.git}"
+  case "$host" in github.com|github.com-*) ;; *) return 1 ;; esac
+  case "$path" in */*) ;; *) return 1 ;; esac
+  printf '%s\n' "$path"
+}
+
+# acct_access_for_dir <dir> [first] — devrig accounts (with a --gh-user set)
+# that have PUSH access to <dir>'s origin repo. This is the signal that
+# actually matters, and the reason this whole feature exists: the accounts
+# differ precisely in which repos they can reach, so "who can push here" is a
+# checkable fact rather than a guess. With `first`, stops at the first match.
+#
+# Checked per-account WITHOUT touching gh's global active account: each
+# account's own token is passed via GH_TOKEN for that one call, so probing
+# never disturbs whatever the rest of the machine is doing.
+#
+# PUSH access specifically, not mere visibility — on any PUBLIC repo every
+# logged-in account gets READ, so a visibility check would call every public
+# repo ambiguous. ADMIN/MAINTAIN/WRITE is what distinguishes "this is my
+# account for this repo" from "I can see it like anyone else".
+acct_access_for_dir() {
+  local dir="${1:-$PWD}" first_only="${2:-}"
+  local slug; slug="$(_acct_repo_slug "$dir")" || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  local n ghuser tok perm
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    ghuser="$(_acct_ghuser "$n")"
+    [ -n "$ghuser" ] || continue
+    tok="$(gh auth token --user "$ghuser" 2>/dev/null)" || continue
+    [ -n "$tok" ] || continue
+    perm="$(GH_TOKEN="$tok" gh repo view "$slug" --json viewerPermission \
+      --jq .viewerPermission 2>/dev/null)" || continue
+    case "$perm" in
+      ADMIN|MAINTAIN|WRITE)
+        echo "$n"
+        [ -n "$first_only" ] && return 0
+        ;;
+    esac
+  done <<EOF
+$(_acct_names)
+EOF
+  return 0
+}
+
+# Absolute PHYSICAL path, without requiring the directory to exist yet (you often
+# want to bind a directory you are about to clone into).
+#
+# The physical part matters: git resolves a repository's real path before testing
+# it against `gitdir:`, so a pattern containing a symlink never matches. On macOS
+# /tmp and /var are themselves symlinks (/private/tmp, /private/var), so binding
+# a path under either would silently never apply. Resolve what exists, keep the
+# rest as given.
+_acct_abspath() {
+  local p="${1%/}" tail=""
+  case "$p" in
+    /*) ;;
+     *) p="$PWD/$p" ;;
+  esac
+  # Walk up until we find a directory that exists, resolve it, re-append the rest.
+  while [ -n "$p" ] && [ ! -d "$p" ]; do
+    tail="${p##*/}${tail:+/$tail}"
+    p="${p%/*}"
+  done
+  [ -n "$p" ] || { echo "/$tail"; return; }
+  p="$(cd "$p" 2>/dev/null && pwd -P)" || return 1
+  echo "${p%/}${tail:+/$tail}"
+}
+
+acct_add() {
+  local name="${1:-}"; shift 2>/dev/null || true
+  local email="" gitname="" host="github.com" dir="" ghuser=""
+  if ! _acct_valid_name "$name"; then
+    echo "gp account: account name required (letters, digits, . _ - only)" >&2; return 2
+  fi
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --email)   email="${2:-}"; shift 2 || return 2 ;;
+      --name)    gitname="${2:-}"; shift 2 || return 2 ;;
+      --host)    host="${2:-}"; shift 2 || return 2 ;;
+      --dir)     dir="${2:-}"; shift 2 || return 2 ;;
+      --gh-user) ghuser="${2:-}"; shift 2 || return 2 ;;
+      *) echo "gp account: unknown option '$1'" >&2; return 2 ;;
+    esac
+  done
+  [ -n "$email" ] || { echo "gp account: --email is required" >&2; return 2; }
+  [ -n "$host" ]  || { echo "gp account: --host cannot be empty" >&2; return 2; }
+  gitname="${gitname:-$name}"
+
+  local key alias identity
+  key="$(_acct_key "$name")"; alias="$host-$name"; identity="$(_acct_identity "$name")"
+
+  # ssh refuses to use a key or config dir with loose permissions.
+  mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"
+  mkdir -p "$(dirname "$SSH_CONFIG")"
+
+  if [ -f "$key" ]; then
+    echo "reusing existing key: ${key/#$HOME/~}"
+  else
+    # No passphrase: this is a convenience tool and a passphrase would need agent
+    # plumbing on every clone. The key is protected by file permissions only.
+    ssh-keygen -t ed25519 -C "$name" -f "$key" -N "" -q
+    echo "created key: ${key/#$HOME/~}"
+  fi
+
+  if grep -qE "^# (gitplus|devrig):account:$name BEGIN" "$SSH_CONFIG" 2>/dev/null; then
+    echo "ssh host alias already present: $alias"
+  else
+    touch "$SSH_CONFIG" && chmod 600 "$SSH_CONFIG"
+    {
+      echo ""
+      echo "# gitplus:account:$name BEGIN"
+      echo "Host $alias"
+      echo "  HostName $host"
+      echo "  User git"
+      echo "  IdentityFile $key"
+      # Without IdentitiesOnly, ssh offers every key the agent holds and the
+      # wrong account can answer first.
+      echo "  IdentitiesOnly yes"
+      echo "  AddKeysToAgent yes"
+      # UseKeychain is a macOS-only keyword; elsewhere ssh errors on it.
+      [ "$(uname -s)" = Darwin ] && echo "  UseKeychain yes"
+      echo "# gitplus:account:$name END"
+    } >> "$SSH_CONFIG"
+    echo "added ssh host alias: $alias"
+  fi
+
+  if [ -f "$identity" ]; then
+    echo "keeping existing identity file: ${identity/#$HOME/~}"
+  else
+    printf '[user]\n\tname = %s\n\temail = %s\n' "$gitname" "$email" > "$identity"
+    echo "wrote identity: ${identity/#$HOME/~}  ($gitname <$email>)"
+  fi
+
+  # --gh-user pairs this account with a `gh` CLI login (see the ghswitch
+  # feature) so a bound directory keeps the right gh identity active — gh's
+  # own "active account" is a single global setting shared by every terminal,
+  # so anything else using a different identity anywhere can flip it back.
+  # Idempotent-append like everything else here: never overwrites a
+  # different value already recorded, tells you how to change it by hand.
+  if [ -n "$ghuser" ]; then
+    local existing; existing="$(_acct_ghuser "$name")"
+    if [ "$existing" = "$ghuser" ]; then
+      echo "gh user already recorded: $ghuser"
+    elif [ -n "$existing" ]; then
+      echo "gp account: gh user already set to '$existing' for '$name' — edit the" >&2
+      echo "  # gitplus:ghuser:$name line in $SSH_CONFIG by hand to change it" >&2
+    else
+      printf '# gitplus:ghuser:%s %s\n' "$name" "$ghuser" >> "$SSH_CONFIG"
+      echo "recorded gh user: $ghuser"
+    fi
+  fi
+
+  [ -n "$dir" ] && acct_bind "$name" "$dir"
+
+  # With a gh login to upload through, getting the key onto GitHub is one
+  # browser approval rather than a copy-paste; do it now when someone is here.
+  if [ -n "$ghuser" ] && [ "$host" = github.com ] && [ -t 0 ] && [ -t 1 ] \
+     && command -v gh >/dev/null 2>&1; then
+    echo ""
+    acct_register "$name"
+    return 0
+  fi
+
+  echo ""
+  echo "Add this key to the $host account '$name' (or, with --gh-user set,"
+  echo "run: gp account register $name):"
+  echo ""
+  cat "$key.pub"
+  echo ""
+  echo "Then clone through the alias so the right key is used:"
+  echo "  git clone git@$alias:<owner>/<repo>.git <dir>"
+  echo ""
+  echo "If the org enforces SAML SSO, also click 'Configure SSO' next to the key"
+  echo "in its settings and authorize it for that org, or clones will be refused."
+  return 0
+}
+
+# --- ssh: is the key on GitHub, and do bound repos use it ------------------
+# Overridable for tests, which can't talk to GitHub.
+SSH_BIN="${GITPLUS_SSH:-ssh}"
+
+_acct_block_field() {  # _acct_block_field <name> <Host|HostName> — from the account's ssh block
+  [ -f "$SSH_CONFIG" ] || return 0
+  awk -v n="$1" -v k="$2" '
+    index($0, "account:" n " BEGIN") && $0 ~ /^# (gitplus|devrig):account:/ { f = 1; next }
+    f && index($0, "account:" n " END") { exit }
+    f && $1 == k { print $2; exit }
+  ' "$SSH_CONFIG"
+}
+_acct_alias() { _acct_block_field "$1" Host; }
+_acct_host()  { local h; h="$(_acct_block_field "$1" HostName)"; echo "${h:-github.com}"; }
+
+# _acct_ssh_user <name> — who the host says the account's key belongs to.
+# Returns 0 and prints the username, 1 when the key is refused, 2 when it
+# couldn't ask (no alias, no network, unknown host key under BatchMode).
+_acct_ssh_user() {
+  local alias out; alias="$(_acct_alias "$1")"
+  [ -n "$alias" ] || return 2
+  out="$("$SSH_BIN" -T -o BatchMode=yes -o ConnectTimeout=10 "git@$alias" </dev/null 2>&1)" || true
+  case "$out" in
+    *"Hi "*"!"*) out="${out#*Hi }"; echo "${out%%!*}"; return 0 ;;
+    *"Permission denied (publickey)"*) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+_acct_routes_ssh() {  # true if the account's identity file rewrites https to its alias
+  grep -qF "# gitplus:route-ssh BEGIN" "$(_acct_identity "$1")" 2>/dev/null
+}
+
+# Make every repo under the account's bound directories reach the host through
+# the account's ssh alias, without editing any remote: the rewrite lives in the
+# identity file, which git only includes inside those directories. Only call
+# this once the host has accepted the key — before that, the rewrite would turn
+# https pushes that work today into "Permission denied (publickey)".
+_acct_route_ssh() {
+  local name="$1" identity alias host
+  identity="$(_acct_identity "$name")"; alias="$(_acct_alias "$name")"; host="$(_acct_host "$name")"
+  [ -f "$identity" ] && [ -n "$alias" ] || return 1
+  if _acct_routes_ssh "$name"; then
+    echo "routing  : already on (https://$host/ -> git@$alias:)"
+    return 0
+  fi
+  {
+    echo ""
+    echo "# gitplus:route-ssh BEGIN"
+    echo "[url \"git@$alias:\"]"
+    printf '\tinsteadOf = https://%s/\n' "$host"
+    printf '\tinsteadOf = git@%s:\n' "$host"
+    printf '\tinsteadOf = ssh://git@%s/\n' "$host"
+    echo "# gitplus:route-ssh END"
+  } >> "$identity"
+  echo "routing  : on — repos bound to '$name' now push and pull over git@$alias"
+}
+
+_acct_scopes() {  # _acct_scopes <token> — the token's OAuth scopes, comma-separated
+  GH_TOKEN="$1" gh api -i user 2>/dev/null \
+    | sed -n 's/^[Xx]-[Oo][Aa]uth-[Ss]copes:[[:space:]]*//p' | tr -d '\r' | head -1 || true
+}
+
+_acct_active_gh() {
+  env -u GH_TOKEN -u GITHUB_TOKEN gh auth status --active --hostname github.com 2>/dev/null \
+    | sed -n 's/.*account \([^ ]*\).*/\1/p' | head -1 || true
+}
+
+# One browser approval that lets <ghuser>'s token add ssh keys. gh can only
+# refresh the ACTIVE account, so this is the one place gitplus switches gh's
+# machine-wide account — for the length of the approval, switched back after,
+# including on Ctrl-C.
+_acct_grant_key_scope() {
+  local ghuser="$1" prev rc=0
+  prev="$(_acct_active_gh)"
+  if [ "$prev" != "$ghuser" ]; then
+    env -u GH_TOKEN -u GITHUB_TOKEN gh auth switch --hostname github.com --user "$ghuser" >/dev/null 2>&1 \
+      || { echo "gp account: couldn't switch gh to $ghuser" >&2; return 1; }
+    # shellcheck disable=SC2064  # $prev is meant to be expanded now
+    trap "env -u GH_TOKEN -u GITHUB_TOKEN gh auth switch --hostname github.com --user '$prev' >/dev/null 2>&1; exit 130" INT TERM
+  fi
+  echo "A browser window will open. Sign in as $ghuser if asked, paste the code"
+  echo "(already on your clipboard) and approve. This is needed once per account."
+  echo ""
+  env -u GH_TOKEN -u GITHUB_TOKEN gh auth refresh --hostname github.com \
+    --scopes write:public_key --clipboard || rc=$?
+  if [ -n "$prev" ] && [ "$prev" != "$ghuser" ]; then
+    env -u GH_TOKEN -u GITHUB_TOKEN gh auth switch --hostname github.com --user "$prev" >/dev/null 2>&1
+    trap - INT TERM
+  fi
+  return "$rc"
+}
+
+# gp account register <name> — get the account's key accepted by GitHub, then
+# route its bound repos over ssh. Safe to re-run: a key that already works is
+# only verified.
+acct_register() {
+  local name="${1:-}"
+  _acct_valid_name "$name" || { echo "gp account: account name required" >&2; return 2; }
+  local key ghuser host who rc tok scopes
+  key="$(_acct_key "$name").pub"; ghuser="$(_acct_ghuser "$name")"; host="$(_acct_host "$name")"
+  [ -f "$key" ] || { echo "gp account: no public key for '$name' ($key)" >&2; return 1; }
+
+  rc=0; who="$(_acct_ssh_user "$name")" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    if [ -n "$ghuser" ] && [ "$who" != "$ghuser" ]; then
+      echo "ssh key  : WRONG ACCOUNT — $host accepts it as '$who', not '$ghuser'." >&2
+      echo "           Remove it from $who's keys (https://$host/settings/keys), then re-run." >&2
+      return 1
+    fi
+    echo "ssh key  : ok — $host accepts it as $who"
+    _acct_route_ssh "$name"
+    return
+  fi
+  if [ "$rc" -eq 2 ]; then
+    echo "ssh key  : can't verify — couldn't reach $host over ssh" >&2
+    return 1
+  fi
+
+  # Refused: upload it with the account's own token.
+  if [ "$host" != github.com ] || [ -z "$ghuser" ] || ! command -v gh >/dev/null 2>&1; then
+    echo "ssh key  : not accepted by $host. Add it by hand:" >&2
+    echo "           https://$host/settings/ssh/new" >&2
+    cat "$key" >&2
+    return 1
+  fi
+  tok="$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --hostname github.com --user "$ghuser" 2>/dev/null)" || tok=""
+  if [ -z "$tok" ]; then
+    echo "gp account: gh isn't logged in as $ghuser (run: gh auth login --hostname github.com)" >&2
+    return 1
+  fi
+  scopes="$(_acct_scopes "$tok")"
+  case ", $scopes," in
+    *", write:public_key,"*|*", admin:public_key,"*) ;;
+    *)
+      if [ ! -t 0 ] || [ ! -t 1 ]; then
+        echo "ssh key  : not accepted by GitHub, and adding it needs a one-time browser" >&2
+        echo "           approval. Run in a terminal: gp account register $name" >&2
+        return 1
+      fi
+      _acct_grant_key_scope "$ghuser" || { echo "gp account: approval didn't complete" >&2; return 1; }
+      tok="$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --hostname github.com --user "$ghuser" 2>/dev/null)"
+      ;;
+  esac
+
+  local title out
+  title="gitplus $name ($(hostname -s 2>/dev/null || echo this-mac))"
+  if ! out="$(GH_TOKEN="$tok" gh api -X POST user/keys -f title="$title" -f key="$(cat "$key")" 2>&1)"; then
+    case "$out" in
+      *"already in use"*)
+        echo "ssh key  : GitHub has this key on a different account already." >&2
+        echo "           Remove it there (https://github.com/settings/keys), then re-run." >&2 ;;
+      *)
+        echo "ssh key  : GitHub refused the key: $out" >&2
+        echo "           (an enterprise may restrict SSH keys for $ghuser)" >&2 ;;
+    esac
+    return 1
+  fi
+  echo "ssh key  : added to $ghuser as \"$title\""
+
+  rc=0; who="$(_acct_ssh_user "$name")" || rc=$?
+  if [ "$rc" -eq 0 ] && [ "$who" = "$ghuser" ]; then
+    echo "ssh key  : verified — GitHub accepts it as $who"
+    _acct_route_ssh "$name"
+  else
+    echo "ssh key  : added, but ssh still isn't accepted as $ghuser." >&2
+    echo "           If the org uses SAML SSO, authorize the key for it at" >&2
+    echo "           https://github.com/settings/keys (Configure SSO), then re-run." >&2
+    return 1
+  fi
+}
+
+acct_bind() {
+  local name="${1:-}" dir="${2:-}"
+  if ! _acct_valid_name "$name"; then
+    echo "gp account: account name required" >&2; return 2
+  fi
+  [ -n "$dir" ] || { echo "gp account: directory required" >&2; return 2; }
+  local identity; identity="$(_acct_identity "$name")"
+  if [ ! -f "$identity" ]; then
+    echo "gp account: no such account '$name' (run: gp account add $name --email ...)" >&2
+    return 1
+  fi
+  dir="$(_acct_abspath "$dir")"
+  if grep -qE "^# (gitplus|devrig):bind:$name BEGIN $dir$" "$GITCONFIG" 2>/dev/null; then
+    echo "already bound: $dir -> $name"; return 0
+  fi
+  local origin=""
+  [ -d "$dir" ] && origin="$(_acct_repo_slug "$dir" 2>/dev/null || true)"
+  touch "$GITCONFIG"
+  {
+    echo ""
+    echo "# gitplus:bind:$name BEGIN $dir"
+    # The trailing slash is what makes this match the directory AND everything
+    # under it; without it git matches nothing useful.
+    echo "[includeIf \"gitdir:$dir/\"]"
+    printf '\tpath = %s\n' "$identity"
+    # Which repo this was, so `sweep` can find it again if the directory moves.
+    [ -n "$origin" ] && echo "# gitplus:origin $origin"
+    echo "# gitplus:bind:$name END $dir"
+  } >> "$GITCONFIG"
+  echo "bound: ${dir/#$HOME/~} -> $name"
+  [ -d "$dir" ] || echo "  note: that directory does not exist yet; the binding" \
+                        "activates once you clone into it."
+
+  # Deliberately does NOT run `gh auth switch` to apply this immediately.
+  # That setting is global to the whole machine, so writing it here would
+  # yank the identity out from under every other terminal and agent session
+  # currently working as a different account. Applying the new binding to the
+  # shell you're standing in is the ghswitch feature's job, and it does it
+  # per-shell via GH_TOKEN (its `devrig` wrapper re-runs the hook right after
+  # this command returns, since a subprocess can't export into its parent).
+  return 0
+}
+
+# gp account unbind <name> <dir>   drop one binding
+# gp account unbind --missing      drop every binding whose directory is gone
+#
+# The one edit here that rewrites ~/.gitconfig rather than appending to it, so
+# it removes only lines between a binding's own BEGIN/END sentinels, checks
+# the result still parses before swapping it in, and keeps a backup.
+acct_unbind() {
+  local pairs="" name dir
+  if [ "${1:-}" = "--missing" ]; then
+    local line
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      dir="${line#* }"
+      [ -d "$dir" ] || pairs="$pairs$line
+"
+    done <<EOF
+$(_acct_binds)
+EOF
+    if [ -z "$pairs" ]; then echo "no bindings point at missing directories"; return 0; fi
+  else
+    name="${1:-}"; dir="${2:-}"
+    _acct_valid_name "$name" && [ -n "$dir" ] \
+      || { echo "usage: gp account unbind <name> <dir> | --missing" >&2; return 2; }
+    # Exactly as recorded when it exists; resolved like bind did when it doesn't.
+    if ! _acct_binds | grep -qxF "$name $dir"; then dir="$(_acct_abspath "$dir")"; fi
+    if ! _acct_binds | grep -qxF "$name $dir"; then
+      echo "gp account: '$name' is not bound to $dir" >&2; return 1
+    fi
+    pairs="$name $dir
+"
+  fi
+
+  _acct_unbind_pairs "$pairs"
+}
+
+# _acct_unbind_pairs "<name> <dir>\n..." — remove those bindings' blocks.
+_acct_unbind_pairs() {
+  local pairs="$1"
+  local tmp; tmp="$(mktemp "$GITCONFIG.gitplus.XXXXXX")"
+  # Through the environment: BSD awk rejects a newline inside a -v value.
+  GP_UNBIND="$pairs" awk '
+    BEGIN { n = split(ENVIRON["GP_UNBIND"], p, "\n"); for (i = 1; i <= n; i++) if (p[i] != "") want[p[i]] = 1 }
+    {
+      line = $0
+      if (match(line, /^# (gitplus|devrig):bind:[^ ]+ BEGIN /)) {
+        key = substr(line, RSTART, RLENGTH); sub(/^# (gitplus|devrig):bind:/, "", key); sub(/ BEGIN $/, "", key)
+        if ((key " " substr(line, RLENGTH + 1)) in want) { skip = 1; held = ""; next }
+      }
+      if (skip) {
+        if (match(line, /^# (gitplus|devrig):bind:[^ ]+ END /)) skip = 0
+        next
+      }
+      # A blank line belongs to the block after it (bind writes one before
+      # each block), so hold blanks until we know whether that block stays.
+      if (line == "") { held = held "\n"; next }
+      printf "%s%s\n", (held == "" ? "" : substr(held, 2) "\n"), line; held = ""
+    }
+    END { if (held != "") printf "%s", substr(held, 2) "\n" }
+  ' "$GITCONFIG" > "$tmp"
+  if ! git config --file "$tmp" --list >/dev/null 2>&1; then
+    rm -f "$tmp"
+    echo "gp account: result didn't parse as git config — left $GITCONFIG untouched" >&2
+    return 1
+  fi
+  cp "$GITCONFIG" "$GITCONFIG.gitplus-bak"
+  cat "$tmp" > "$GITCONFIG"    # in place, so a symlinked dotfile stays a symlink
+  rm -f "$tmp"
+  local p
+  while IFS= read -r p; do
+    [ -n "$p" ] && echo "unbound: $(_acct_tilde "${p#* }") (was ${p%% *})"
+  done <<EOF
+$pairs
+EOF
+  echo "backup: ${GITCONFIG/#$HOME/~}.gitplus-bak"
+}
+
+_acct_tilde() { case "$1" in "$HOME"|"$HOME"/*) echo "~${1#"$HOME"}" ;; *) echo "$1" ;; esac; }
+
+_acct_bind_origin() {  # _acct_bind_origin <name> <dir> — owner/repo recorded at bind time
+  [ -f "$GITCONFIG" ] || return 0
+  awk -v b="bind:$1 BEGIN $2" -v e="bind:$1 END $2" '
+    /^# (gitplus|devrig):bind:/ && substr($0, index($0, "bind:")) == b { f = 1; next }
+    f && /^# (gitplus|devrig):bind:/ && substr($0, index($0, "bind:")) == e { exit }
+    f && /^# gitplus:origin / { print $3; exit }
+  ' "$GITCONFIG"
+}
+
+# Every git repository under the search roots, one "<dir> <owner/repo>" per
+# line (owner/repo empty when there's no GitHub origin). Main checkouts only:
+# a linked worktree follows its main repository anyway.
+_acct_repo_index() {
+  local roots="${GITPLUS_SEARCH_ROOTS:-$HOME}" root d
+  local IFS=:
+  for root in $roots; do
+    [ -d "$root" ] || continue
+    find "$root" -maxdepth 4 \( -name Library -o -name node_modules -o -name .Trash \
+        -o -name .cache -o -name .venv -o -name .git \) -prune -o -type d -print 2>/dev/null \
+      | while IFS= read -r d; do
+          [ -d "$d/.git" ] || continue
+          printf '%s %s\n' "$d" "$(_acct_repo_slug "$d" 2>/dev/null || true)"
+        done || true   # find exits 1 on any unreadable dir; what it did list is still good
+  done
+}
+
+# gp account sweep [--yes] — deal with bindings whose directory is gone.
+#
+# A dead binding usually means the repo moved, or was a worktree that got
+# removed, and dropping it blindly loses which account a moved repo should
+# use. So each one is traced first (by the origin recorded at bind time, else
+# by directory name) and given a plan: drop it when its repo is already bound
+# to the same account elsewhere or can't be found, rebind it when its repo
+# turned up unbound, and leave it alone when that repo is now bound to a
+# different account. The choices are asked about; without a terminal the plan
+# is only printed, unless --yes accepts it.
+acct_sweep() {
+  local yes=""; [ "${1:-}" = "--yes" ] && yes=1
+  local ask=""
+  [ -z "$yes" ] && [ -t 0 ] && [ -t 1 ] && ask=1
+  exec 3<&0    # prompts read the real stdin; the loops below take it over
+
+  local dead="" line n d
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    d="${line#* }"
+    [ -d "$d" ] || dead="$dead$line
+"
+  done <<EOF
+$(_acct_binds)
+EOF
+  if [ -z "$dead" ]; then echo "no bindings point at missing directories"; return 0; fi
+
+  echo "looking for where those repos went..."
+  local index; index="$(_acct_repo_index)"
+  echo ""
+
+  local drops="" rebinds="" kept=0 origin how cands c owner plan cpath ans
+  local same free other other_owner
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    n="${line%% *}"; d="${line#* }"
+    origin="$(_acct_bind_origin "$n" "$d")"
+    if [ -n "$origin" ]; then
+      how="origin $origin"
+      cands="$(printf '%s\n' "$index" | awk -v o="$origin" '$2 == o { print $1 }')"
+    else
+      how="name '${d##*/}'"
+      cands="$(printf '%s\n' "$index" | awk -v b="${d##*/}" '{ p = $1; sub(/.*\//, "", p); if (p == b) print $1 }')"
+    fi
+
+    # Best candidate: one already bound to this account, else an unbound one,
+    # else one bound to somebody else.
+    same=""; free=""; other=""; other_owner=""
+    while IFS= read -r c; do
+      [ -n "$c" ] || continue
+      owner="$(_acct_bound_name "$c" 2>/dev/null || true)"
+      if [ "$owner" = "$n" ]; then
+        [ -n "$same" ] || same="$c"
+      elif [ -z "$owner" ]; then
+        [ -n "$free" ] || free="$c"
+      elif [ -z "$other" ]; then
+        other="$c"; other_owner="$owner"
+      fi
+    done <<EOF
+$cands
+EOF
+
+    echo "$(_acct_tilde "$d")  ($n)"
+    plan="drop"; cpath=""
+    if [ -n "$same" ]; then
+      echo "  why : gone; its repo (matched by $how) is at $(_acct_tilde "$same"),"
+      echo "        already bound to $n — worktrees of it follow that binding"
+      echo "  plan: drop"
+    elif [ -n "$free" ]; then
+      echo "  why : moved? a repo matching by $how is at $(_acct_tilde "$free"), unbound"
+      echo "  plan: rebind it there"
+      plan="rebind"; cpath="$free"
+      if [ -n "$ask" ]; then
+        printf '  [r]ebind / [d]rop / [k]eep? (r) '
+        read -r ans <&3 || ans=""
+        case "$ans" in d|D) plan="drop" ;; k|K) plan="keep" ;; esac
+      fi
+    elif [ -n "$other" ]; then
+      echo "  why : a repo matching by $how is at $(_acct_tilde "$other"), but it's"
+      echo "        bound to $other_owner, not $n — which account should it use?"
+      echo "  plan: keep (changes nothing)"
+      plan="keep"
+      if [ -n "$ask" ]; then
+        printf '  [k]eep / [d]rop / [r]ebind %s to %s? (k) ' "$(_acct_tilde "$other")" "$n"
+        read -r ans <&3 || ans=""
+        case "$ans" in d|D) plan="drop" ;; r|R) plan="rebind"; cpath="$other" ;; esac
+      fi
+    else
+      echo "  why : gone, and no repo matching by $how was found"
+      echo "  plan: drop"
+    fi
+    case "$plan" in
+      drop)   drops="$drops$n $d
+" ;;
+      rebind) drops="$drops$n $d
+"
+              rebinds="$rebinds$n $cpath
+" ;;
+      keep)   kept=$((kept + 1)) ;;
+    esac
+    echo ""
+  done <<EOF
+$dead
+EOF
+
+  local nd nr
+  nd="$(printf '%s' "$drops" | grep -c . || true)"
+  nr="$(printf '%s' "$rebinds" | grep -c . || true)"
+  if [ "$nd" -eq 0 ]; then echo "nothing to change ($kept kept)."; return 0; fi
+  if [ -z "$ask" ] && [ -z "$yes" ]; then
+    echo "nothing changed. Run it in a terminal to decide, or accept this plan: gp account sweep --yes"
+    return 0
+  fi
+  if [ -n "$ask" ]; then
+    printf 'Apply: remove %s binding(s), %s of them rebound to the new place? [Y/n] ' "$nd" "$nr"
+    read -r ans <&3 || ans=""
+    case "$ans" in n|N|no) echo "nothing changed."; return 0 ;; esac
+  fi
+  _acct_unbind_pairs "$drops"
+  while IFS= read -r line; do
+    [ -n "$line" ] && acct_bind "${line%% *}" "${line#* }"
+  done <<EOF
+$rebinds
+EOF
+  return 0
+}
+
+acct_list() {
+  local names; names="$(_acct_names)"
+  if [ -z "$names" ]; then
+    echo "no accounts registered (gp account add <name> --email <email>)"
+    return 0
+  fi
+  local n line d
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    local identity who="" ghuser
+    identity="$(_acct_identity "$n")"
+    [ -f "$identity" ] && who="$(sed -n 's/^[[:space:]]*email[[:space:]]*=[[:space:]]*//p' "$identity" | head -1)"
+    echo "$n${who:+  <$who>}"
+    ghuser="$(_acct_ghuser "$n")"
+    [ -n "$ghuser" ] && echo "    gh: $ghuser"
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      [ "${line%% *}" = "$n" ] || continue
+      d="${line#* }"
+      echo "    ${d/#$HOME/~}"
+    done <<EOF
+$(_acct_binds)
+EOF
+  done <<EOF
+$names
+EOF
+}
+
+acct_key() {
+  local name="${1:-}" key
+  _acct_valid_name "$name" || { echo "gp account: account name required" >&2; return 2; }
+  key="$(_acct_key "$name").pub"
+  [ -f "$key" ] || { echo "gp account: no public key for '$name' ($key)" >&2; return 1; }
+  cat "$key"
+}
+
+# The reason this feature is worth having. A bound directory that gets renamed
+# still looks fine — git silently falls back to your global identity and the
+# wrong name lands on every commit, with no error anywhere. `check` is what
+# turns that into something visible.
+acct_check() {
+  local fix=""
+  [ "${1:-}" = "--fix" ] && fix=1
+  # The loops below read their lists from stdin, which would hide the
+  # terminal from register's browser approval; keep the real stdin on fd 3.
+  exec 3<&0
+  local problems=0 n identity key line d expect_email actual repo
+  local names; names="$(_acct_names)"
+  if [ -z "$names" ]; then echo "no accounts registered"; return 0; fi
+
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    echo "$n"
+    key="$(_acct_key "$n")"; identity="$(_acct_identity "$n")"
+    if [ -f "$key" ] && [ -f "$key.pub" ]; then
+      echo "  key      : ok (${key/#$HOME/~})"
+    else
+      echo "  key      : MISSING ($key)"; problems=$((problems + 1))
+    fi
+    if [ -f "$identity" ]; then
+      expect_email="$(sed -n 's/^[[:space:]]*email[[:space:]]*=[[:space:]]*//p' "$identity" | head -1)"
+      echo "  identity : ok <$expect_email>"
+    else
+      echo "  identity : MISSING ($identity)"; problems=$((problems + 1)); expect_email=""
+    fi
+
+    local ghuser; ghuser="$(_acct_ghuser "$n")"
+    if [ -n "$ghuser" ]; then
+      if ! command -v gh >/dev/null 2>&1; then
+        echo "  gh user  : $ghuser — can't verify (gh CLI not installed)"
+      elif gh auth status 2>&1 | grep -qF "account $ghuser"; then
+        echo "  gh user  : ok ($ghuser logged in)"
+      else
+        echo "  gh user  : NOT LOGGED IN as $ghuser (run: gh auth login --hostname github.com)"
+        problems=$((problems + 1))
+      fi
+    fi
+
+    # A key can stop working without anything changing on this machine — an
+    # org can expire or revoke it — and every git operation in the account's
+    # repos then fails with "Permission denied (publickey)". Ask GitHub.
+    if [ -f "$key.pub" ] && [ -n "$(_acct_alias "$n")" ]; then
+      local who src
+      src=0; who="$(_acct_ssh_user "$n")" || src=$?
+      if [ "$src" -eq 0 ] && { [ -z "$ghuser" ] || [ "$who" = "$ghuser" ]; }; then
+        echo "  ssh key  : ok (accepted as $who)"
+        if _acct_routes_ssh "$n"; then
+          echo "  routing  : https -> ssh"
+        elif [ -n "$fix" ]; then
+          printf '  '; _acct_route_ssh "$n" || problems=$((problems + 1))
+        else
+          echo "  routing  : off (https remotes use gh's token; turn on with: gp account check --fix)"
+        fi
+      elif [ "$src" -eq 0 ]; then
+        echo "  ssh key  : WRONG ACCOUNT — accepted as $who, not $ghuser"
+        problems=$((problems + 1))
+      elif [ "$src" -eq 1 ]; then
+        if [ -n "$fix" ]; then
+          echo "  ssh key  : not accepted by GitHub — registering:"
+          # Not piped through anything: register needs the terminal for the
+          # browser approval, and checks for it.
+          acct_register "$n" <&3 || problems=$((problems + 1))
+        else
+          echo "  ssh key  : NOT ACCEPTED by GitHub (fix: gp account check --fix)"
+          problems=$((problems + 1))
+        fi
+      else
+        echo "  ssh key  : can't verify (couldn't reach GitHub over ssh)"
+      fi
+    fi
+
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      [ "${line%% *}" = "$n" ] || continue
+      d="${line#* }"
+      if [ ! -d "$d" ]; then
+        # The rename/move case: the includeIf still points at a path that is
+        # no longer there, so nothing applies it and commits go out as you.
+        echo "  bind     : BROKEN ${d/#$HOME/~} (directory does not exist —"
+        echo "             renamed or moved? commits there use your global identity;"
+        echo "             sweep dead ones with: gp account sweep)"
+        problems=$((problems + 1)); continue
+      fi
+      # Prove it end-to-end where we can: includeIf only evaluates inside a
+      # repo, so find one at the bind root or one level down.
+      repo=""
+      if [ -d "$d/.git" ]; then repo="$d"
+      else
+        for cand in "$d"/*/.git; do
+          [ -d "$cand" ] && { repo="${cand%/.git}"; break; }
+        done
+      fi
+      if [ -z "$repo" ]; then
+        echo "  bind     : ok ${d/#$HOME/~} (no repo there yet to verify against)"
+      else
+        actual="$(git -C "$repo" config user.email 2>/dev/null || true)"
+        if [ -n "$expect_email" ] && [ "$actual" = "$expect_email" ]; then
+          echo "  bind     : ok ${d/#$HOME/~} (verified <$actual>)"
+        else
+          echo "  bind     : WRONG ${d/#$HOME/~} — git resolves <${actual:-none}>,"
+          echo "             expected <$expect_email>"
+          problems=$((problems + 1))
+        fi
+      fi
+    done <<EOF
+$(_acct_binds)
+EOF
+  done <<EOF
+$names
+EOF
+
+  echo ""
+  if [ "$problems" -eq 0 ]; then
+    echo "all good."
+  else
+    echo "$problems problem(s) found."
+    return 1
+  fi
+}
+
+cmd_account() {
+  case "${1:-list}" in
+    add)   shift; acct_add "$@" ;;
+    bind)  shift; acct_bind "$@" ;;
+    unbind) shift; acct_unbind "$@" ;;
+    # Same verb as `gp sweep` (merged branches) and `gp wsweep` (dead worktrees).
+    sweep) shift 2>/dev/null || true; acct_sweep "$@" ;;
+    list)  shift 2>/dev/null || true; acct_list ;;
+    key)   shift; acct_key "$@" ;;
+    check) shift 2>/dev/null || true; acct_check "$@" ;;
+    register) shift; acct_register "$@" ;;
+    # Internal, not in `devrig help` — used by the ghswitch shell feature.
+    _gh-for-dir) shift; acct_gh_for_dir "$@" ;;
+    _access-for-dir) shift; acct_access_for_dir "$@" ;;
+    *) echo "gp account: unknown command '$1' (add, bind, unbind, sweep, list, key, register, check)" >&2; return 2 ;;
+  esac
+}
+
+cmd_account "$@"

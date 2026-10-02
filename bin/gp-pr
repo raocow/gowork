@@ -1,0 +1,1232 @@
+#!/usr/bin/env bash
+#
+# gp-pr — list your open PRs, check one out, or merge one or more.
+#
+#   gp pr                list your open PRs in this repo, as "<url> -- <title>"
+#   gp pr --no-title     just the URLs, one per line (easy to pipe)   [-nt]
+#   gp pr --copy         also copy the listing to the clipboard         [-c]
+#   gp pr --global       every open PR under every authed gh account,
+#                         across all repos — works outside a repo too   [-g]
+#   gp pr <n|branch>     check out that PR's branch, updated to the PR's latest
+#   gp pr list <ids...>  show title/link for specific PR(s) instead of
+#                         checking out — any count, any author, any state
+#   gp pr merge <ids...> merge specific PR(s) (number, branch, URL, or a
+#                         "NNN-MMM" range — all mixable)
+#   gp pr merge --all    merge every mergeable PR you authored   [-a]
+#   gp pr close <ids...> close specific PR(s) without merging — same id
+#                         grammar as merge; --all closes all of yours   [-a]
+#   gp pr unmerge <ids...>  revert already-merged PR(s) by opening a revert
+#                         PR for each (via gh pr revert)
+#   gp pr ... -x <ids...>   exclude PR(s) from any of the above   [--exclude]
+#
+# The checkout/list argument (and each merge argument) can be a PR number, a
+# head branch name, or a PR URL — whatever `gh` can resolve to a pull request.
+# It can also be "." or "@", meaning the branch you're currently on (the PR
+# for the current branch — same idea as `gh pr view` with no argument); this
+# works anywhere an id is accepted, so `gp pr list .` shows the current
+# branch's PR, `gp pr .` checks it out, `gp pr merge .` merges it. Bare
+# `gp pr` / `gp pr list` with no token still lists all your open PRs.
+# Checkout uses `gh pr checkout`, which creates the branch or fast-forwards an
+# existing one to the PR's latest — so you're never on a stale copy. For a
+# merged/closed PR whose head branch was deleted from origin, it falls back to
+# `refs/pull/<n>/head`; if GitHub is unreachable, it falls back to a local
+# branch (the stamped one for a number, or the named branch itself), switched
+# to as-is (not updated).
+#
+# `gp pr <id>` (no subcommand, exactly one plain id, no -x) checks that PR
+# out — you can't check out more than one at once. To just see a single PR's
+# title/link without touching your working tree, say so explicitly with
+# `gp pr list <id>`. Naming PRs explicitly via `list` isn't scoped to you —
+# same principle as `gp pr merge <ids>` — and shows every state (open,
+# closed, merged), not just open. Ids that can't be a checkout (2+ of them, a
+# range, or -x) are an ERROR rather than an implicit list: one of those forms
+# changes your working tree and the other doesn't, which is too sharp a
+# difference to hinge on how many arguments you happened to type.
+#
+# `gp pr merge` touches shared remote state (it merges PRs on GitHub), but it
+# acts by default — pass -n/--dry-run to preview first. There is no --force;
+# anything blocked by branch protection (required reviews/checks) is always
+# left alone, never bypassed.
+#
+# `gp pr merge <ids...>` merges exactly the PRs you named, whoever authored
+# them (same as naming a PR to `gh pr merge` — you're being explicit, so it's
+# not scoped to your own). `gp pr merge --all` has no ids and is a broad
+# sweep, so THAT form only ever considers PRs YOU authored — merging someone
+# else's PR isn't a sweep's call to make.
+#
+# An id may be a "NNN-MMM" range of PR numbers (either order), expanded into
+# individual ids — a token only counts as a range if it's ENTIRELY digits, so
+# a branch name like "task-42" passes through untouched. -x/--exclude takes
+# one or more ids (same forms, plus ranges) to drop from either --all or an
+# explicit id list — everything after -x is an exclude until the next flag.
+# Duplicate/excluded ids that resolve to the same PR are each counted once.
+#
+# Merge order: it computes which of the targeted PRs touch overlapping files
+# and processes the least-entangled ones first (fewest others sharing a
+# changed file), so a PR that's easy to land doesn't sit behind one that needs
+# a rebase. This is a static, one-time ordering from each PR's changed-file
+# list — no LLM, no guessing, just a conflict-adjacency count.
+#
+# For each PR, in that order:
+#   - mergeStateStatus CLEAN/UNSTABLE  → merge it directly (gh pr merge).
+#   - BEHIND                           → try a direct merge first — GitHub's
+#                                         own merge does a real three-way merge
+#                                         server-side and often succeeds with
+#                                         no local rebase at all. Only on
+#                                         failure does it fall back to the
+#                                         DIRTY path below.
+#   - DIRTY                            → rebase the branch onto its base in a
+#                                         scratch worktree (never touches your
+#                                         current branch/worktree) and push; if
+#                                         the rebase itself hits conflicts,
+#                                         abort it and skip — that needs a human.
+#   - BLOCKED (required checks/reviews) → skip; never bypassed.
+#   - draft                            → skip.
+# Every merge attempt retries a few times with a short pause on failure —
+# right after a push, GitHub can take a moment to recompute mergeability, so
+# a bare first attempt can fail even though the PR is genuinely mergeable.
+# Skipped PRs are listed at the end with why. Merging one PR can change the
+# status of the ones after it (e.g. newly BEHIND) — each PR's status is
+# re-checked right before it's handled, not just at the start.
+#
+# The merge method (merge/squash/rebase) defaults to the repo's own default
+# (`gh repo view`'s viewerDefaultMergeMethod), or --method to override for the
+# whole run. Individual PRs can override that with -s/--squash, -m/--merge and
+# -r/--rebase — the same spellings `gh pr merge` uses.
+#
+# A method flag applies BACKWARD, to every id to its left that no other method
+# flag has already claimed. Equivalently: each id takes the method of the
+# nearest method flag to its RIGHT, and an id with none uses the default. So
+#     gp pr merge 12-31 --merge 42 43-51 -s
+# merges 12-31 with a merge commit and squashes 42 and 43-51: -s claims 42 and
+# 43-51, and can't reach past the --merge that already claimed 12-31. Ids after
+# the last method flag have nothing to their right and take the default.
+# -x/--exclude composes with this: a method flag ends an -x run like any other
+# flag, and it only ever claims targets, never excludes.
+#
+# Stacked PRs (PR B's base is PR A's head) are handled automatically: when
+# A is merged, B is retargeted to A's base so the stack doesn't break. When
+# merging multiple stacked PRs at once, they're sorted bottom-up so the base
+# merges first.
+#
+# Branches are never auto-deleted after merge — run `gp sweep` afterward.
+#
+# (Named `gp pr`, not `git switch`: git always prefers its built-in `switch`
+# over a script, so a custom `git-switch` could never run. A branch literally
+# named "merge" can't be checked out with `gp pr merge` for the same reason
+# `merge` is claimed as a subcommand — use `gp pr merge merge` if you must.
+# Same goes for "list", "close" and "unmerge".)
+#
+# Usage:
+#   gp pr                          list open PRs you authored ("<url> -- <title>")
+#   gp pr -nt                      list them as bare URLs (--no-title)
+#   gp pr -g                       every open PR under EVERY authed gh account,
+#                                   across all repos (--global; works anywhere)
+#   gp pr <n|branch>                check out a PR by number, branch name, or URL
+#   gp pr list <ids...>            list exactly those PRs — any author, any state
+#   gp pr merge <n|branch|range>... merge the given PR(s); "824-830" is a range
+#   gp pr merge --all              merge every mergeable PR you authored (-a)
+#   gp pr close <ids...>           close the given PR(s) without merging;
+#                                   --all closes every open PR you authored
+#   gp pr unmerge <ids...>         revert merged PR(s) — opens a revert PR
+#   gp pr ... -x <ids...>          exclude PR(s) (--exclude; also takes ranges)
+#   gp pr merge|close|unmerge ... -n   preview instead (--dry-run)
+#   gp pr merge ... --method squash|merge|rebase   default method for the run
+#   gp pr merge <ids> -s|-m|-r     method for just those ids (--squash/--merge/
+#                                   --rebase; claims the ids to its left)
+#   gp pr -h                       show this help
+#
+set -euo pipefail
+
+# Resolve this script's real location (following symlinks — it's installed as
+# one) to find lib/gitplus-common.sh, shared across the git-* tools: the
+# color/step/warn helpers and expand_ranges().
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+source "$(cd -P "$(dirname "$_src")/.." && pwd)/lib/gitplus-common.sh"
+
+usage() {
+  cat <<'EOF'
+gp pr — list your open PRs, check one out, or merge one or more.
+
+  gp pr                      list your open PRs in this repo, as "<url> -- <title>"
+  gp pr -nt                  list them as bare URLs (--no-title)
+  gp pr -c                   also copy the listing to the clipboard (--copy;
+                              works with any listing form, not merge)
+  gp pr -g                   every open PR under EVERY gh account you're
+                              logged into, across all repos (--global).
+                              Works outside a repo. Listing only — no ids,
+                              no -x, not with merge.
+  gp pr <n|branch>           check out that PR (by number, branch name, or
+                              URL), updated to the PR's latest
+  gp pr list <ids...>        show title/link for specific PR(s) instead of
+                              checking out — any count, any author, any state
+  gp pr list .               show the PR for the CURRENT branch ('.' or '@'
+                              means the branch you're on — works anywhere an
+                              id is accepted: list, checkout, merge, -x)
+  gp pr merge <ids...>       merge the given PR(s) (number, branch, URL, or a
+                              "824-830" range — all mixable), rebasing what
+                              needs it, skipping what needs a human
+  gp pr merge --all          merge every mergeable PR YOU authored (-a)
+  gp pr close <ids...>       close the given PR(s) without merging — same id
+                              grammar as merge (numbers, branches, URLs,
+                              ranges, ./@)
+  gp pr close --all          close every open PR YOU authored (-a)
+  gp pr unmerge <ids...>     revert already-merged PR(s): opens a revert PR
+                              for each, which you then merge to undo it
+  gp pr ... -x <ids>         exclude PR(s) from any of the above (--exclude;
+                              also takes ranges — everything after -x is
+                              excluded until the next flag)
+  gp pr merge|close|unmerge ... -n
+                              preview instead: show the plan, change nothing
+  gp pr -h                   show this help
+
+Uses the GitHub CLI (gh). Checkout falls back to refs/pull/<n>/head for deleted
+branches, or (offline) to the local branch.
+
+`gp pr <id>` (no subcommand, exactly one plain id, no -x) checks it out — you
+can't check out more than one PR at once. To see a single PR's title/link
+without touching your working tree, say so explicitly with `gp pr list <id>`.
+Naming PRs explicitly (via `list`, or bare multi/range/-x — kept for old
+muscle memory) isn't scoped to you.
+
+`gp pr merge <ids>` merges exactly the PRs you named, whoever authored them.
+`gp pr merge --all` (no ids) is a broad sweep, so it only ever considers PRs
+YOU authored — merging someone else's PR isn't a sweep's call to make. Branch
+protection (required reviews/checks) is never bypassed either way. PRs are
+merged in an order chosen to minimize conflicts — the least-entangled ones
+(fewest others touching the same files) go first. A PR needing a rebase gets
+one, in a scratch worktree that never touches your current branch; if the
+rebase itself conflicts, that PR is skipped for you to resolve by hand.
+
+  gp pr merge 824-830 -x 825 827   merge #824-830 except #825 and #827
+
+Merge method: --method squash|merge|rebase sets it for the whole run (default:
+the repo's own). Individual PRs override it with -s/--squash, -m/--merge,
+-r/--rebase — gh pr merge's own spellings. A method flag applies BACKWARD, to
+every id to its left not already claimed by another method flag; equivalently,
+each id takes the nearest method flag to its RIGHT, and ids with none take the
+default. -x composes: a method flag ends an -x run, and only ever claims
+targets, never excludes.
+
+  gp pr merge 12-31 --merge 42 43-51 -s
+                                #12-31 by merge commit; #42 and #43-51 squashed
+  gp pr merge 1 2 -s 3         #1 and #2 squashed; #3 takes the default
+EOF
+}
+
+id=""
+notitle=0
+copy=0
+global=0
+subcmd=""
+all=0
+dry=0
+method=""
+raw_targets=()   # positional args before -x: ids and/or "NNN-MMM" ranges
+raw_methods=()   # parallel to raw_targets: that id's merge method ("" = default)
+raw_excludes=()  # positional args after -x/--exclude
+in_exclude=0     # once -x is seen, bare tokens go to raw_excludes until another flag
+method_flagged=0 # whether any per-id method flag (-s/-m/-r) was given
+
+# A method flag applies BACKWARD, to every id to its left that doesn't already
+# have one — i.e. each id takes the method of the nearest method flag to its
+# RIGHT, and ids with none fall back to the default. That's what makes
+#   gp pr merge 12-31 --merge 42 43-51 -s
+# mean "12-31 by merge commit, 42 and 43-51 squashed": -s claims 42 and 43-51,
+# and --merge already claimed 12-31, so -s can't reach past it. Ids after the
+# last method flag have no flag to their right and use the default.
+_claim_pending() {  # _claim_pending <method>
+  local i=0
+  while [ "$i" -lt "${#raw_targets[@]}" ]; do
+    [ -z "${raw_methods[$i]:-}" ] && raw_methods[$i]="$1"
+    i=$((i + 1))
+  done
+  method_flagged=1
+}
+
+# `merge`/`list`/`close` are subcommands, not flags: `gp pr merge <ids...>` /
+# `--all`, `gp pr list <ids...>`, `gp pr close <ids...>`.
+if [ "${1:-}" = "merge" ]; then subcmd="merge"; shift;
+elif [ "${1:-}" = "list" ]; then subcmd="list"; shift;
+elif [ "${1:-}" = "close" ]; then subcmd="close"; shift;
+elif [ "${1:-}" = "unmerge" ]; then subcmd="unmerge"; shift; fi
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -nt|--no-title) notitle=1; in_exclude=0 ;;
+    -c|--copy) copy=1; in_exclude=0 ;;
+    -g|--global) global=1; in_exclude=0 ;;
+    -a|--all) all=1; in_exclude=0 ;;
+    -n|--dry-run) dry=1; in_exclude=0 ;;
+    -x|--exclude) in_exclude=1 ;;
+    # Same spellings gh pr merge uses, so they read the same way here.
+    -s|--squash) _claim_pending squash; in_exclude=0 ;;
+    -m|--merge)  _claim_pending merge;  in_exclude=0 ;;
+    -r|--rebase) _claim_pending rebase; in_exclude=0 ;;
+    --method) shift; method="${1:-}"; in_exclude=0 ;;
+    -*) echo "gp pr: unknown option '$1' (try -h)" >&2; exit 2 ;;
+    *)
+      if [ "$in_exclude" = 1 ]; then
+        raw_excludes+=("$1")
+      else
+        raw_targets+=("$1"); raw_methods+=("")
+      fi
+      ;;
+  esac
+  shift
+done
+
+if [ "$global" = 1 ]; then
+  if [ "$subcmd" = "merge" ]; then
+    echo "gp pr: -g/--global is for listing, not merging — merging across every repo you have access to isn't something a single flag should do" >&2; exit 2
+  fi
+  if [ "${#raw_targets[@]}" -gt 0 ] || [ "${#raw_excludes[@]}" -gt 0 ]; then
+    echo "gp pr: -g/--global lists everything and takes no ids (or -x)" >&2; exit 2
+  fi
+fi
+
+if [ "$subcmd" = "merge" ]; then
+  if [ "$all" = 1 ] && [ "${#raw_targets[@]}" -gt 0 ]; then
+    echo "gp pr merge: can't combine --all with specific PRs" >&2; exit 2
+  fi
+  if [ "$all" = 0 ] && [ "${#raw_targets[@]}" -eq 0 ]; then
+    echo "gp pr merge: specify PR(s) to merge (number, branch, or URL — 'NNN-MMM' for a range), or --all for every one of your open PRs" >&2; exit 2
+  fi
+elif [ "$subcmd" = "close" ]; then
+  if [ "$all" = 1 ] && [ "${#raw_targets[@]}" -gt 0 ]; then
+    echo "gp pr close: can't combine --all with specific PRs" >&2; exit 2
+  fi
+  if [ "$all" = 0 ] && [ "${#raw_targets[@]}" -eq 0 ]; then
+    echo "gp pr close: specify PR(s) to close (number, branch, or URL — 'NNN-MMM' for a range), or --all for every one of your open PRs" >&2; exit 2
+  fi
+  if [ -n "$method" ] || [ "$method_flagged" = 1 ]; then
+    echo "gp pr close: merge-method flags only apply to 'gp pr merge'" >&2; exit 2
+  fi
+elif [ "$subcmd" = "unmerge" ]; then
+  # No --all here on purpose. "Revert every PR I ever merged" has no sane
+  # reading, and unlike close (reopenable) this puts new commits on the base
+  # branch — naming what you want reverted should be deliberate.
+  if [ "$all" = 1 ]; then
+    echo "gp pr unmerge: no --all — name the PR(s) to revert explicitly" >&2; exit 2
+  fi
+  if [ "${#raw_targets[@]}" -eq 0 ]; then
+    echo "gp pr unmerge: specify the merged PR(s) to revert (number, branch, or URL — 'NNN-MMM' for a range)" >&2; exit 2
+  fi
+  if [ -n "$method" ] || [ "$method_flagged" = 1 ]; then
+    echo "gp pr unmerge: merge-method flags only apply to 'gp pr merge'" >&2; exit 2
+  fi
+else
+  # --all is also valid here (explicitly "all my open PRs", same meaning as
+  # the implicit default when no targets are given) so its grammar mirrors
+  # `gp pr merge --all`; -n/--method/-s/-m/-r genuinely don't apply to listing.
+  if [ "$dry" = 1 ] || [ -n "$method" ] || [ "$method_flagged" = 1 ]; then
+    echo "gp pr: --dry-run and the merge-method flags only apply to 'gp pr merge' and 'gp pr close'" >&2; exit 2
+  fi
+  if [ "$all" = 1 ] && [ "${#raw_targets[@]}" -gt 0 ]; then
+    echo "gp pr: can't combine --all with specific PRs" >&2; exit 2
+  fi
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# -g/--global: every open PR you have anywhere, under every gh account you're
+# logged into — not just the active one, and not scoped to a repo.
+#
+# Deliberately before require_git_repo: this is the one form that isn't about
+# the repo you're standing in, so it has to work from anywhere. It's also the
+# answer to a real confusion — with per-directory identities, a plain
+# `gp pr` showing nothing only means the ACTIVE account has nothing here,
+# which looks identical to "I have no work in flight".
+#
+# Each account is queried with its own token via GH_TOKEN for that one call,
+# never `gh auth switch` — that setting is machine-wide and switching it
+# would yank the identity out from under every other terminal and agent on
+# the box.
+# ══════════════════════════════════════════════════════════════════════════
+if [ "$global" = 1 ]; then
+  require_gh "gp pr"
+  # Deliberately NOT gh_scope_to_repo here: -g is the one form that isn't
+  # about the current repo. With GH_TOKEN set, `gh auth status` lists the
+  # env-token identity IN ADDITION to the keyring accounts (verified: the
+  # scoped account appears twice), so this loop would query it twice and
+  # print each of its PRs twice.
+  accounts="$(gh auth status 2>&1 | sed -n 's/.*Logged in to [^ ]* account \([^ ]*\).*/\1/p')"
+  if [ -z "$accounts" ]; then
+    echo "gp pr: no accounts logged in to gh (try: gh auth login)" >&2; exit 1
+  fi
+  rows=""
+  for acct in $accounts; do
+    atok="$(gh auth token --user "$acct" 2>/dev/null || true)"
+    [ -n "$atok" ] || continue
+    arows="$(GH_TOKEN="$atok" gh search prs --author "@me" --state open --limit 100 \
+      --json number,url,title,repository \
+      --jq '.[] | "\(.repository.nameWithOwner)\t\(.number)\t\(.url)\t\(.title)"' 2>/dev/null || true)"
+    [ -n "$arows" ] || continue
+    # Tag each row with the account it came from, so a mixed list says which
+    # identity owns what — the whole point of looking across accounts.
+    while IFS= read -r r; do
+      [ -n "$r" ] && rows="$rows$r	$acct
+"
+    done <<EOF
+$arows
+EOF
+  done
+
+  listing="$(printf '%s' "$rows" | sed '/^$/d' \
+    | sort -t "$(printf '\t')" -k1,1 -k2,2n \
+    | while IFS=$'\t' read -r repo num url title acct; do
+        line="$url"
+        [ "$notitle" = 1 ] || line="$url -- $title"
+        [ "$notitle" = 1 ] || line="$line ${_dim}($acct)${_off}"
+        echo "$line"
+      done)"
+
+  if [ -n "$listing" ]; then
+    printf '%s\n' "$listing"
+    if [ "$copy" = 1 ]; then
+      printf '%s\n' "$listing" | pbcopy
+      printf '%s✓%s %s\n' "$_ok" "$_off" "copied to clipboard" >&2
+    fi
+  else
+    printf 'no open PRs under any gh account %s(%s)%s\n' \
+      "$_dim" "$(printf '%s' "$accounts" | tr '\n' ' ' | sed 's/ $//')" "$_off"
+  fi
+  exit 0
+fi
+
+require_git_repo "gp pr"
+
+# A target or exclude of '.' or '@' means the current branch — the PR for the
+# branch you're on (same idea as `gh pr view` with no argument). Resolve it to
+# the real branch name up front so every downstream path (checkout, list,
+# exclude) treats it like any other branch name. This is an explicit extra
+# token, not a change to the default: bare `gp pr` / `gp pr list` still
+# lists all your open PRs. ('.'/'@' can't be a real PR number or branch name,
+# so claiming them collides with nothing.)
+_here=0
+if [ "${#raw_targets[@]}" -gt 0 ]; then
+  for t in ${raw_targets[@]+"${raw_targets[@]}"}; do case "$t" in .|@) _here=1 ;; esac; done
+fi
+if [ "${#raw_excludes[@]}" -gt 0 ]; then
+  for t in ${raw_excludes[@]+"${raw_excludes[@]}"}; do case "$t" in .|@) _here=1 ;; esac; done
+fi
+if [ "$_here" = 1 ]; then
+  here_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [ -z "$here_branch" ] || [ "$here_branch" = HEAD ]; then
+    echo "gp pr: '.'/'@' means the current branch, but you're on a detached HEAD" >&2; exit 1
+  fi
+  i=0; while [ "$i" -lt "${#raw_targets[@]}" ]; do
+    case "${raw_targets[$i]}" in .|@) raw_targets[$i]="$here_branch" ;; esac; i=$((i + 1))
+  done
+  i=0; while [ "$i" -lt "${#raw_excludes[@]}" ]; do
+    case "${raw_excludes[$i]}" in .|@) raw_excludes[$i]="$here_branch" ;; esac; i=$((i + 1))
+  done
+fi
+
+# expand_ranges (shared, from lib/gitplus-common.sh) expands "NNN-MMM"
+# range tokens into individual ids — a token only counts as a range if it's
+# ENTIRELY digits-hyphen-digits, so a branch name like "task-42" passes
+# through untouched. Applied to both the target list and the exclude list,
+# so -x accepts ranges too.
+# Expanded one token at a time rather than in bulk, so each resulting id keeps
+# the method its original token carried (a range inherits the range's method).
+merge_ids=()
+merge_methods=()
+_ti=0
+while [ "$_ti" -lt "${#raw_targets[@]}" ]; do
+  _one=()
+  expand_ranges "gp pr" _one "${raw_targets[$_ti]}"
+  for _e in ${_one[@]+"${_one[@]}"}; do
+    merge_ids+=("$_e")
+    merge_methods+=("${raw_methods[$_ti]:-}")
+  done
+  _ti=$((_ti + 1))
+done
+exclude_ids=()
+[ "${#raw_excludes[@]}" -gt 0 ] && expand_ranges "gp pr" exclude_ids ${raw_excludes[@]+"${raw_excludes[@]}"}
+
+# No-subcommand dispatch: with ids, bare `gp pr` means exactly one thing —
+# check that PR out. It used to ALSO mean "list these" whenever the ids
+# couldn't be a checkout (2+ of them, a range, or -x), which made the same
+# command shape do two unrelated things a character apart:
+#     gp pr 422        → checks out #422's branch
+#     gp pr 422-423    → printed a list, touched nothing
+# One of those changes your working tree and one doesn't, so guessing wrong
+# is not a small mistake. That form is now an error pointing at `gp pr
+# list`, which has always been the explicit spelling. Bare `gp pr` with no
+# ids still lists your open PRs — nothing ambiguous about that one.
+if [ "$subcmd" = "" ] && { [ "${#raw_targets[@]}" -gt 0 ] || [ "${#raw_excludes[@]}" -gt 0 ]; }; then
+  if [ "${#raw_targets[@]}" -eq 1 ] && [ "${#raw_excludes[@]}" -eq 0 ] \
+     && ! printf '%s' "${raw_targets[0]}" | grep -qE '^[0-9]+-[0-9]+$'; then
+    id="${raw_targets[0]}"
+  else
+    _args="${raw_targets[*]}"
+    [ "${#raw_excludes[@]}" -gt 0 ] && _args="$_args -x ${raw_excludes[*]}"
+    echo "gp pr: '$_args' can't be a checkout — you can only check out one PR at a time." >&2
+    echo "  to list those PRs:      gp pr list $_args" >&2
+    echo "  to check just one out:  gp pr <id>" >&2
+    exit 2
+  fi
+fi
+
+require_gh "gp pr"
+gh_scope_to_repo
+
+# ══════════════════════════════════════════════════════════════════════════
+# gp pr merge: merge specific PR(s), or --all mergeable PRs you authored.
+# ══════════════════════════════════════════════════════════════════════════
+if [ "$subcmd" = "merge" ]; then
+  [ -n "$method" ] && method="$(printf '%s' "$method" | tr '[:upper:]' '[:lower:]')"
+  case "$method" in
+    ""|merge|squash|rebase) ;;
+    *) echo "gp pr merge: --method must be merge, squash, or rebase" >&2; exit 2 ;;
+  esac
+
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  files_dir="$tmp/files"
+  mkdir -p "$files_dir"
+
+  # Resolve the merge method: explicit --method, else the repo's own default
+  # (gh repo view's viewerDefaultMergeMethod comes back UPPERCASE), else squash.
+  if [ -z "$method" ]; then
+    method="$(gh repo view --json viewerDefaultMergeMethod --jq '.viewerDefaultMergeMethod // ""' 2>/dev/null || true)"
+    method="$(printf '%s' "$method" | tr '[:upper:]' '[:lower:]')"
+    case "$method" in merge|squash|rebase) ;; *) method=squash ;; esac
+  fi
+  skipped=()
+
+  # "<num>:<method>" pairs for PRs given an explicit per-id method flag; every
+  # other PR falls through to $method (the --method override, or the repo's
+  # own default resolved above).
+  method_map=""
+  method_for() {  # method_for <num> -> the merge method for that PR
+    local n="$1" pair
+    for pair in $method_map; do
+      case "$pair" in "$n":*) printf '%s' "${pair#*:}"; return ;; esac
+    done
+    printf '%s' "$method"
+  }
+
+  # Resolve -x/--exclude ids to PR numbers up front (an exclude that doesn't
+  # resolve to anything is just a no-op, not an error — it may already be
+  # closed, which is what you wanted anyway).
+  exclude_nums=""
+  for xid in ${exclude_ids[@]+"${exclude_ids[@]}"}; do
+    xn="$(gh pr view "$xid" --json number --jq '.number' 2>/dev/null || true)"
+    [ -n "$xn" ] && exclude_nums="$exclude_nums $xn"
+  done
+
+  # Gather the PR numbers to work on. --all is a broad sweep, so it's scoped
+  # to PRs YOU authored — merging someone else's PR isn't a sweep's call to
+  # make. Explicit ids are resolved (number/branch/URL, whoever authored them)
+  # and deduped, since the same PR could be named twice (e.g. by number and by
+  # branch). -x/--exclude removes matching PRs from either set.
+  if [ "$all" = 1 ]; then
+    nums=""
+    for n in $(gh pr list --state open --author "@me" --limit 200 --json number --jq '.[].number' 2>/dev/null || true); do
+      case " $exclude_nums " in *" $n "*) continue ;; esac
+      nums="$nums $n"
+    done
+    if [ -z "$nums" ]; then
+      echo "gp pr merge: no open PRs authored by you in this repo (after --exclude)."
+      exit 0
+    fi
+  else
+    nums=""; seen_nums=""
+    mi=0
+    while [ "$mi" -lt "${#merge_ids[@]}" ]; do
+      mid="${merge_ids[$mi]}"; mid_method="${merge_methods[$mi]:-}"
+      mi=$((mi + 1))
+      n="$(gh pr view "$mid" --json number,state --jq 'select(.state == "OPEN") | .number' 2>/dev/null || true)"
+      if [ -z "$n" ]; then
+        skipped+=("$mid -- couldn't resolve to an open PR")
+        continue
+      fi
+      case " $seen_nums " in *" $n "*) continue ;; esac
+      seen_nums="$seen_nums $n"
+      case " $exclude_nums " in *" $n "*) skipped+=("#$n -- excluded"); continue ;; esac
+      nums="$nums $n"
+      # Record only an explicit per-id method; anything else resolves to the
+      # default at lookup time.
+      [ -n "$mid_method" ] && method_map="$method_map $n:$mid_method"
+    done
+    if [ -z "$nums" ]; then
+      echo "gp pr merge: none of the given PR(s) could be resolved (or all were excluded)."
+      if [ "${#skipped[@]}" -gt 0 ]; then
+        echo "Skipped:"; for s in ${skipped[@]+"${skipped[@]}"}; do echo "  $s"; done
+      fi
+      exit 0
+    fi
+  fi
+
+  overlap_input="$tmp/overlap_input"; : > "$overlap_input"
+  titles_file="$tmp/titles"; : > "$titles_file"
+
+  cand=()
+  for num in $nums; do
+    info="$(gh pr view "$num" --json headRefName,baseRefName,isDraft,title \
+      --jq '"\(.headRefName)\t\(.baseRefName)\t\(.isDraft)\t\(.title)"' 2>/dev/null)" || continue
+    head="${info%%$'\t'*}"; rest="${info#*$'\t'}"
+    base="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+    draft="${rest%%$'\t'*}"; title="${rest#*$'\t'}"
+    printf '%s\t%s\t%s\n' "$num" "$head" "$base" >> "$tmp/meta"
+    printf '%s\t%s\n' "$num" "$title" >> "$titles_file"
+    if [ "$draft" = "true" ]; then
+      skipped+=("#$num $title -- draft")
+      continue
+    fi
+    gh pr view "$num" --json files --jq '.files[].path' 2>/dev/null | sort -u > "$files_dir/$num"
+    cand+=("$num")
+  done
+
+  if [ "${#cand[@]}" -eq 0 ]; then
+    echo "gp pr merge: nothing to merge (all given PRs are drafts or unreadable)."
+    if [ "${#skipped[@]}" -gt 0 ]; then
+      echo "Skipped:"; for s in ${skipped[@]+"${skipped[@]}"}; do echo "  $s"; done
+    fi
+    exit 0
+  fi
+
+  # Order candidates by conflict-adjacency: for each PR, count how many other
+  # candidates share at least one changed file; sort ascending (least-entangled
+  # first), tie-break by PR number.
+  #
+  # Built as an inverted index (file -> the PRs that touch it) rather than a
+  # pairwise scan over every PR pair: cost scales with the total number of
+  # changed files, not the square of the PR count, so it stays fast even with
+  # a large open-PR count (most files belong to exactly one PR and cost
+  # nothing here; only files shared by multiple PRs do any work).
+  cand_list="$tmp/cand_list"; printf '%s\n' ${cand[@]+"${cand[@]}"} > "$cand_list"
+  pairs="$tmp/pairs"; : > "$pairs"
+  for num in ${cand[@]+"${cand[@]}"}; do
+    [ -s "$files_dir/$num" ] || continue
+    sed "s/\$/\t$num/" "$files_dir/$num" >> "$pairs"
+  done
+  awk -F'\t' '
+    FNR == NR { allnums[$1] = 1; next }
+    { byfile[$1] = byfile[$1] " " $2 }
+    END {
+      for (f in byfile) {
+        n = split(byfile[f], nums, " ")
+        for (i = 1; i <= n; i++)
+          for (j = 1; j <= n; j++) {
+            if (i == j) continue
+            key = nums[i] SUBSEP nums[j]
+            if (!(key in seen)) { seen[key] = 1; ov[nums[i]]++ }
+          }
+      }
+      for (p in allnums) printf "%d\t%s\n", (p in ov ? ov[p] : 0), p
+    }
+  ' "$cand_list" "$pairs" > "$overlap_input"
+  order=()
+  while IFS=$'\t' read -r _ovnum num; do order+=("$num"); done < <(sort -n -k1,1 -k2,2 "$overlap_input")
+
+  # Stack-aware reorder: if PR A's base branch is PR B's head branch, B must
+  # merge first. Stable — non-stacked PRs keep their overlap-based position.
+  if [ -s "$tmp/meta" ] && [ "${#order[@]}" -gt 1 ]; then
+    stack_sorted="$(awk -F'\t' '
+      NR == FNR { cands[++N] = $1; is_cand[$1] = 1; next }
+      ($1 in is_cand) { head[$1] = $2; base[$1] = $3 }
+      END {
+        for (i = 1; i <= N; i++) depth[cands[i]] = 0
+        changed = 1
+        while (changed) {
+          changed = 0
+          for (i = 1; i <= N; i++) {
+            p = cands[i]
+            for (j = 1; j <= N; j++) {
+              q = cands[j]
+              if (p != q && base[p] == head[q] && depth[p] <= depth[q]) {
+                depth[p] = depth[q] + 1; changed = 1
+              }
+            }
+          }
+        }
+        for (i = 1; i <= N; i++)
+          printf "%d\t%d\t%s\n", depth[cands[i]], i, cands[i]
+      }
+    ' <(printf '%s\n' ${order[@]+"${order[@]}"}) "$tmp/meta" \
+      | sort -n -k1,1 -k2,2 | cut -f3)"
+    order=()
+    while IFS= read -r num; do [ -n "$num" ] && order+=("$num"); done <<< "$stack_sorted"
+  fi
+
+  title_of() { grep -m1 "^$1"$'\t' "$titles_file" | cut -f2-; }
+  meta_of()  { grep -m1 "^$1"$'\t' "$tmp/meta"; }   # num\thead\tbase
+
+  # After merging a PR, retarget any open PRs whose base is the merged branch
+  # so the stack doesn't break. This is the thing that makes stacked PRs work:
+  # merge the bottom, children get retargeted to main (or whatever the parent
+  # was targeting), and they're ready to merge next.
+  retarget_children() {
+    local merged_head="$1" merged_base="$2" is_dry="$3"
+    local children
+    children="$(gh pr list --base "$merged_head" --state open \
+      --json number,title --jq '.[] | "\(.number)\t\(.title)"' 2>/dev/null)" || return 0
+    [ -n "$children" ] || return 0
+    while IFS=$'\t' read -r child_num child_title; do
+      [ -n "$child_num" ] || continue
+      if [ "$is_dry" = 1 ]; then
+        step "would retarget #$child_num ${_dim}($child_title)${_off} ${_branch}[-> $merged_base]${_off}"
+      elif gh pr edit "$child_num" --base "$merged_base" >/dev/null 2>&1; then
+        step "retargeted #$child_num ${_dim}($child_title)${_off} ${_branch}[-> $merged_base]${_off}"
+      else
+        warn "couldn't retarget #$child_num to $merged_base"
+      fi
+    done <<< "$children"
+  }
+
+  # Retry `gh pr merge` a few times with a short pause. Right after a push,
+  # GitHub can take a moment to recompute mergeability — an immediate merge
+  # attempt can fail even though the PR is genuinely mergeable, which used to
+  # mean skipping and telling you to rerun the whole command just to wait a
+  # few seconds. Bounded (not indefinite), so a real failure still surfaces
+  # promptly. Prints the last attempt's output; exit status is its own.
+  merge_with_retry() {
+    local num="$1" flag="$2" tries=0 err
+    while true; do
+      if err="$(gh pr merge "$num" "$flag" 2>&1)"; then
+        printf '%s' "$err"; return 0
+      fi
+      tries=$((tries + 1))
+      [ "$tries" -ge 3 ] && { printf '%s' "$err"; return 1; }
+      sleep 2
+    done
+  }
+
+  # Rebase a PR's branch onto its base in a scratch worktree, then push. Never
+  # touches the current worktree/branch. Returns 0 on a clean rebase (and
+  # leaves it pushed), 1 if the rebase itself needs manual resolution.
+  rebase_and_push() {
+    local head="$1" base="$2"
+    # -x for a whole-LINE match, not just -F with a trailing literal newline
+    # appended to the pattern: real (BSD/FreeBSD) grep on macOS treats an
+    # embedded \n inside a -F pattern as a pattern SEPARATOR, splitting it
+    # into two patterns — the real string, and an empty one after the \n.
+    # An empty pattern matches every line, so `grep -qF "...$branch"$'\n'`
+    # silently matched ANY worktree output at all, making this guard always
+    # fire (skip every PR needing a rebase) regardless of real state. Found
+    # because it happened to work fine when tested through Claude Code's
+    # interactive shell, which transparently substitutes a different grep
+    # implementation (ugrep) that doesn't have this quirk — but the real
+    # /usr/bin/grep the script actually runs with does.
+    if git worktree list --porcelain | grep -qFx "branch refs/heads/$head"; then
+      return 2   # branch is checked out elsewhere — don't touch it
+    fi
+    local wt; wt="$tmp/wt-$head"
+    git fetch --quiet origin "$head" "$base" 2>/dev/null || return 3
+    git worktree add --quiet -B "$head" "$wt" "origin/$head" >/dev/null 2>&1 || return 3
+    local ok=0
+    if (cd "$wt" && git rebase --quiet "origin/$base" >/dev/null 2>&1); then
+      if (cd "$wt" && git push --quiet --force-with-lease "origin" "HEAD:$head" >/dev/null 2>&1); then
+        ok=0
+      else
+        ok=4   # rebased locally but couldn't push (protected ref, race, etc.)
+      fi
+    else
+      (cd "$wt" && git rebase --abort >/dev/null 2>&1) || true
+      ok=1
+    fi
+    git worktree remove --force "$wt" >/dev/null 2>&1 || true
+    return "$ok"
+  }
+
+  merged=()
+  plan=()   # dry-run: "#n title -- action" lines
+
+  for num in ${order[@]+"${order[@]}"}; do
+    title="$(title_of "$num")"
+    meta="$(meta_of "$num")"; head="$(printf '%s' "$meta" | cut -f2)"; base="$(printf '%s' "$meta" | cut -f3)"
+    pr_method="$(method_for "$num")"; pr_flag="--$pr_method"
+
+    status="$(gh pr view "$num" --json mergeStateStatus --jq '.mergeStateStatus' 2>/dev/null || echo UNKNOWN)"
+
+    case "$status" in
+      CLEAN|UNSTABLE)
+        if [ "$dry" = 1 ]; then
+          plan+=("#$num $title -- merge ($pr_method)")
+          retarget_children "$head" "$base" 1; continue
+        fi
+        if err="$(merge_with_retry "$num" "$pr_flag")"; then
+          step "merged #$num ${_dim}($title)${_off} ${_branch}[$head -> $base]${_off}"
+          merged+=("#$num $title")
+          retarget_children "$head" "$base" 0
+        else
+          warn "merge failed for #$num — ${err##*$'\n'}"
+          skipped+=("#$num $title -- merge failed: ${err##*$'\n'}")
+        fi
+        ;;
+      BEHIND|DIRTY)
+        if [ "$dry" = 1 ]; then
+          if [ "$status" = "BEHIND" ]; then
+            plan+=("#$num $title -- try direct merge ($pr_method), else rebase onto $base")
+          else
+            plan+=("#$num $title -- rebase onto $base, then merge ($pr_method)")
+          fi
+          retarget_children "$head" "$base" 1; continue
+        fi
+        # BEHIND (not DIRTY) means GitHub hasn't found a textual conflict —
+        # its own merge does a real three-way merge server-side and often
+        # succeeds with no local rebase at all. Try that first and only fall
+        # back to rebasing if it fails. DIRTY means GitHub already found a
+        # real conflict, so go straight to rebasing.
+        merged_directly=0
+        if [ "$status" = "BEHIND" ] && gh pr merge "$num" "$pr_flag" >/dev/null 2>&1; then
+          step "merged #$num ${_dim}($title, no rebase needed)${_off} ${_branch}[$head -> $base]${_off}"
+          merged+=("#$num $title")
+          retarget_children "$head" "$base" 0
+          merged_directly=1
+        fi
+        if [ "$merged_directly" = 0 ]; then
+          # `cmd; rc=$?` looks like it captures the exit code, but under
+          # `set -e` a plain (non-conditional) command returning non-zero
+          # aborts the script right there — before `rc=$?` ever runs. The `||`
+          # form is required: putting the call on the left of `||` exempts it
+          # from errexit, and `rc=$?` on the right still captures its real
+          # exit code. Without this, ANY non-zero return from rebase_and_push
+          # (conflict, branch checked out elsewhere, fetch/push failure) would
+          # silently kill the entire `gp pr merge` run with no message at
+          # all, instead of warning and skipping just this one PR.
+          rc=0; rebase_and_push "$head" "$base" || rc=$?
+          case "$rc" in
+            0)
+              if err="$(merge_with_retry "$num" "$pr_flag")"; then
+                step "rebased + merged #$num ${_dim}($title)${_off} ${_branch}[$head -> $base]${_off}"
+                merged+=("#$num $title")
+                retarget_children "$head" "$base" 0
+              else
+                warn "rebased #$num but merge still hasn't gone through — rerun 'gp pr merge $num' to retry"
+                skipped+=("#$num $title -- rebased and pushed; merge pending (rerun to retry)")
+              fi
+              ;;
+            1) warn "skipping #$num — rebase needs manual conflict resolution"
+               skipped+=("#$num $title -- rebase conflicts, needs manual resolution") ;;
+            2) warn "skipping #$num — branch '$head' is checked out in a worktree"
+               skipped+=("#$num $title -- branch checked out elsewhere") ;;
+            *) warn "skipping #$num — couldn't fetch/rebase '$head'"
+               skipped+=("#$num $title -- couldn't rebase (fetch/push failed)") ;;
+          esac
+        fi
+        ;;
+      BLOCKED)
+        [ "$dry" = 1 ] && { plan+=("#$num $title -- skip: blocked (required checks/reviews)"); continue; }
+        warn "skipping #$num — blocked by required checks or reviews"
+        skipped+=("#$num $title -- blocked (required checks or reviews)")
+        ;;
+      *)
+        if [ "$dry" = 1 ]; then
+          plan+=("#$num $title -- attempt merge ($pr_method; status $status)"); continue
+        fi
+        if err="$(merge_with_retry "$num" "$pr_flag")"; then
+          step "merged #$num ${_dim}($title)${_off} ${_branch}[$head -> $base]${_off}"
+          merged+=("#$num $title")
+          retarget_children "$head" "$base" 0
+        else
+          warn "skipping #$num — $status: ${err##*$'\n'}"
+          skipped+=("#$num $title -- $status: ${err##*$'\n'}")
+        fi
+        ;;
+    esac
+  done
+
+  if [ "$dry" = 1 ]; then
+    echo
+    echo "Dry run — nothing was changed. Order (least-entangled first):"
+    for p in ${plan[@]+"${plan[@]}"}; do echo "  $p"; done
+    [ "${#skipped[@]}" -gt 0 ] && { echo "Would skip:"; for s in ${skipped[@]+"${skipped[@]}"}; do echo "  $s"; done; }
+    echo
+    echo "Run without --dry-run to actually merge."
+  else
+    # Each merge/skip was already narrated as it happened (the ✓/! lines
+    # above) — re-listing every success here by name was pure repetition.
+    # Skips still get listed: unlike a success, "why" is worth having in one
+    # place to act on, not just scroll back to find. When everything merged
+    # cleanly, the one-line tally is a direct continuation of that narration,
+    # not a separate section — no blank line needed. The skip list IS a
+    # separate section worth setting apart, so it keeps its lead-in blank line.
+    if [ "${#skipped[@]}" -eq 0 ]; then
+      echo "Merged all ${#merged[@]}."
+    else
+      echo
+      echo "Merged ${#merged[@]}; unmergeable/skipped (${#skipped[@]}):"
+      for s in ${skipped[@]+"${skipped[@]}"}; do echo "  $s"; done
+    fi
+  fi
+  exit 0
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# gp pr close: close specific PR(s), or --all of your open ones.
+#
+# Same id grammar as merge (number, branch, URL, "." / "@", NNN-MMM ranges,
+# -x to exclude) so the two read alike. Much simpler than merge, though:
+# there's no ordering to compute and nothing to rebase — closing is
+# independent per PR and reversible (reopen), which is also why --all is
+# offered here without the hand-wringing merge --all needs.
+# ══════════════════════════════════════════════════════════════════════════
+if [ "$subcmd" = "close" ]; then
+  skipped=()
+  exclude_nums=""
+  for xid in ${exclude_ids[@]+"${exclude_ids[@]}"}; do
+    xn="$(gh pr view "$xid" --json number --jq '.number' 2>/dev/null || true)"
+    [ -n "$xn" ] && exclude_nums="$exclude_nums $xn"
+  done
+
+  # --all is a broad sweep, so it's scoped to PRs YOU authored — closing
+  # someone else's isn't a sweep's call to make, same rule as merge --all.
+  # Named ids aren't scoped that way: naming one is being explicit.
+  nums=""; seen_nums=""
+  if [ "$all" = 1 ]; then
+    for n in $(gh pr list --state open --author "@me" --limit 200 --json number --jq '.[].number' 2>/dev/null || true); do
+      case " $exclude_nums " in *" $n "*) continue ;; esac
+      nums="$nums $n"
+    done
+    [ -n "$nums" ] || { echo "gp pr close: no open PRs authored by you in this repo (after --exclude)."; exit 0; }
+  else
+    for cid in ${merge_ids[@]+"${merge_ids[@]}"}; do
+      n="$(gh pr view "$cid" --json number,state --jq 'select(.state == "OPEN") | .number' 2>/dev/null || true)"
+      if [ -z "$n" ]; then skipped+=("$cid -- couldn't resolve to an open PR"); continue; fi
+      case " $seen_nums " in *" $n "*) continue ;; esac
+      seen_nums="$seen_nums $n"
+      case " $exclude_nums " in *" $n "*) skipped+=("#$n -- excluded"); continue ;; esac
+      nums="$nums $n"
+    done
+    if [ -z "$nums" ]; then
+      echo "gp pr close: none of the given PR(s) could be resolved (or all were excluded)."
+      if [ "${#skipped[@]}" -gt 0 ]; then
+        echo "Skipped:"; for s in ${skipped[@]+"${skipped[@]}"}; do echo "  $s"; done
+      fi
+      exit 0
+    fi
+  fi
+
+  if [ "$dry" = 1 ]; then
+    echo "Dry run — nothing was changed. Would close:"
+    for n in $nums; do
+      t="$(gh pr view "$n" --json title --jq '.title' 2>/dev/null || true)"
+      echo "  #$n ${_dim}($t)${_off}"
+    done
+    [ "${#skipped[@]}" -gt 0 ] && { echo "Would skip:"; for s in ${skipped[@]+"${skipped[@]}"}; do echo "  $s"; done; }
+    echo
+    echo "Run without --dry-run to actually close."
+    exit 0
+  fi
+
+  closed=0
+  for n in $nums; do
+    t="$(gh pr view "$n" --json title,headRefName,baseRefName \
+      --jq '"\(.title)\t\(.headRefName)\t\(.baseRefName)"' 2>/dev/null || true)"
+    title="${t%%$'\t'*}"; rest="${t#*$'\t'}"
+    head="${rest%%$'\t'*}"; base="${rest#*$'\t'}"
+    if err="$(gh pr close "$n" 2>&1)"; then
+      step "closed #$n ${_dim}($title)${_off} ${_branch}[$head -> $base]${_off}"
+      closed=$((closed + 1))
+    else
+      warn "couldn't close #$n — ${err##*$'\n'}"
+      skipped+=("#$n $title -- close failed: ${err##*$'\n'}")
+    fi
+  done
+
+  if [ "${#skipped[@]}" -eq 0 ]; then
+    echo "Closed all $closed."
+  else
+    echo
+    echo "Closed $closed; skipped (${#skipped[@]}):"
+    for s in ${skipped[@]+"${skipped[@]}"}; do echo "  $s"; done
+  fi
+  exit 0
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# gp pr unmerge: revert already-merged PR(s), by opening a revert PR each.
+#
+# Delegates to `gh pr revert`, which is the right call rather than doing the
+# revert locally: GitHub knows how each PR was actually merged, and the three
+# methods need genuinely different reverts — a merge commit needs `-m 1`, a
+# squash is one commit, and a rebase is N separate commits with no single
+# commit to undo. Reimplementing that guesswork locally would get the rebase
+# case quietly wrong. Going through GitHub also means the revert lands as a
+# reviewable PR that respects branch protection, instead of pushing straight
+# to the base branch.
+#
+# Resolution here looks for MERGED PRs, not OPEN ones — the opposite of every
+# other subcommand, since reverting something still open is a contradiction.
+# ══════════════════════════════════════════════════════════════════════════
+if [ "$subcmd" = "unmerge" ]; then
+  skipped=()
+  exclude_nums=""
+  for xid in ${exclude_ids[@]+"${exclude_ids[@]}"}; do
+    xn="$(gh pr view "$xid" --json number --jq '.number' 2>/dev/null || true)"
+    [ -n "$xn" ] && exclude_nums="$exclude_nums $xn"
+  done
+
+  nums=""; seen_nums=""
+  for uid in ${merge_ids[@]+"${merge_ids[@]}"}; do
+    info="$(gh pr view "$uid" --json number,state,title --jq '"\(.number)\t\(.state)\t\(.title)"' 2>/dev/null || true)"
+    if [ -z "$info" ]; then skipped+=("$uid -- couldn't resolve to a PR"); continue; fi
+    n="${info%%$'\t'*}"; rest="${info#*$'\t'}"
+    st="${rest%%$'\t'*}"; t="${rest#*$'\t'}"
+    if [ "$st" != "MERGED" ]; then
+      # An open PR should be closed, not reverted; a closed one never landed.
+      skipped+=("#$n $t -- not merged (state: $st)")
+      continue
+    fi
+    case " $seen_nums " in *" $n "*) continue ;; esac
+    seen_nums="$seen_nums $n"
+    case " $exclude_nums " in *" $n "*) skipped+=("#$n -- excluded"); continue ;; esac
+    nums="$nums $n"
+  done
+
+  if [ -z "$nums" ]; then
+    echo "gp pr unmerge: none of the given PR(s) are merged (or all were excluded)."
+    if [ "${#skipped[@]}" -gt 0 ]; then
+      echo "Skipped:"; for s in ${skipped[@]+"${skipped[@]}"}; do echo "  $s"; done
+    fi
+    exit 0
+  fi
+
+  if [ "$dry" = 1 ]; then
+    echo "Dry run — nothing was changed. Would open a revert PR for:"
+    for n in $nums; do
+      t="$(gh pr view "$n" --json title --jq '.title' 2>/dev/null || true)"
+      echo "  #$n ${_dim}($t)${_off}"
+    done
+    [ "${#skipped[@]}" -gt 0 ] && { echo "Would skip:"; for s in ${skipped[@]+"${skipped[@]}"}; do echo "  $s"; done; }
+    echo
+    echo "Run without --dry-run to actually open them."
+    exit 0
+  fi
+
+  reverted=0
+  for n in $nums; do
+    t="$(gh pr view "$n" --json title --jq '.title' 2>/dev/null || true)"
+    if out="$(gh pr revert "$n" 2>&1)"; then
+      # gh prints the new PR's URL; surface it, since the revert isn't applied
+      # until that PR is merged and you'll want to go land it.
+      url="$(printf '%s' "$out" | grep -o 'https://[^ ]*' | tail -1)"
+      step "revert PR opened for #$n ${_dim}($t)${_off}${url:+ ${_branch}$url${_off}}"
+      reverted=$((reverted + 1))
+    else
+      warn "couldn't revert #$n — ${out##*$'\n'}"
+      skipped+=("#$n $t -- revert failed: ${out##*$'\n'}")
+    fi
+  done
+
+  if [ "${#skipped[@]}" -eq 0 ]; then
+    echo "Opened $reverted revert PR(s) — merge them to actually undo the change."
+  else
+    echo
+    echo "Opened $reverted; skipped (${#skipped[@]}):"
+    for s in ${skipped[@]+"${skipped[@]}"}; do echo "  $s"; done
+  fi
+  exit 0
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# No single checkout target: list PRs (titles by default) instead. Reached
+# via explicit `gp pr list ...` (any target count, including one) or the
+# no-id bare form (your open PRs).
+#   - no targets → your open PRs (optionally minus -x excludes)
+#   - targets    → exactly those PRs, any author, any state (naming them
+#     explicitly is not scoped to you — same principle as `gp pr merge
+#     <ids>`), optionally minus -x excludes
+# ══════════════════════════════════════════════════════════════════════════
+if [ "$subcmd" != "merge" ] && [ -z "$id" ]; then
+  rows=""
+  if [ "${#merge_ids[@]}" -eq 0 ]; then
+    gh_err=$(mktemp)
+    rc=0
+    rows="$(gh pr list --author "@me" --state open --limit 100 --json number,url,title \
+      --jq '.[] | "\(.number)\t\(.url)\t\(.title)"' 2>"$gh_err")" || rc=$?
+    err="$(cat "$gh_err")"; rm -f "$gh_err"
+    if [ "$rc" -ne 0 ]; then
+      echo "gp pr: couldn't list PRs — ${err:-gh pr list failed (exit $rc)}" >&2
+      exit 1
+    fi
+  else
+    for tid in ${merge_ids[@]+"${merge_ids[@]}"}; do
+      row="$(gh pr view "$tid" --json number,url,title,state \
+        --jq '"\(.number)\t\(.url)\t\(.title)\t\(.state)"' 2>/dev/null || true)"
+      [ -n "$row" ] && rows="$rows
+$row"
+    done
+  fi
+
+  if [ "${#exclude_ids[@]}" -gt 0 ]; then
+    exclude_nums=""
+    for xid in ${exclude_ids[@]+"${exclude_ids[@]}"}; do
+      xn="$(gh pr view "$xid" --json number --jq '.number' 2>/dev/null || true)"
+      [ -n "$xn" ] && exclude_nums="$exclude_nums $xn"
+    done
+    filtered=""
+    while IFS=$'\t' read -r num rest; do
+      [ -z "$num" ] && continue
+      case " $exclude_nums " in *" $num "*) continue ;; esac
+      filtered="$filtered
+$num	$rest"
+    done <<EOF
+$rows
+EOF
+    rows="$filtered"
+  fi
+
+  listing="$(printf '%s\n' "$rows" | sed '/^$/d' | sort -t "$(printf '\t')" -k1,1n -u \
+    | while IFS=$'\t' read -r num url title state; do
+        line="$url"
+        [ "$notitle" = 1 ] || line="$url -- $title"
+        [ -n "${state:-}" ] && [ "$state" != "OPEN" ] && line="$line [$state]"
+        echo "$line"
+      done)"
+  if [ -n "$listing" ]; then
+    printf '%s\n' "$listing"
+  elif [ "${#merge_ids[@]}" -eq 0 ]; then
+    # Genuinely zero PRs is a normal, valid state — but silence here reads
+    # identically whether that's true or the wrong `gh` account is active
+    # (e.g. an unrelated identity that's never authored anything in this
+    # repo). Naming who was actually queried turns that ambiguity into an
+    # immediate, checkable fact instead of a guess.
+    #
+    # Deliberately NOT warn(): "you have no open PRs" is the correct ANSWER to
+    # the question asked, not a problem. Printing it with a ! on stderr made
+    # the ordinary case (just merged everything) look like an auth failure —
+    # reported as exactly that. The account name stays, in dim, so a genuinely
+    # wrong identity is still obvious without dressing up a normal result as
+    # an error.
+    # An empty result has three very different causes that used to look
+    # identical: you genuinely have none, gh is acting as an account that
+    # isn't yours, or gh is resolving a different repo than you think (a fork
+    # remote, an ssh alias). Two rounds of back-and-forth diagnosing exactly
+    # this is what motivated saying it outright. So on the empty path only —
+    # never the hot path — spend a couple of extra calls and report which
+    # repo, which identity, and whether anyone ELSE has PRs open here. That
+    # last one is the tell: "2 open, by alexrao2000" while you queried as
+    # someone else names the problem without anyone having to go digging.
+    me="$(gh api user --jq .login 2>/dev/null || echo '?')"
+    repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || echo '?')"
+    others="$(gh pr list --state open --limit 50 --json author \
+      --jq '[.[].author.login] | unique | join(", ")' 2>/dev/null || true)"
+    printf 'no open PRs in %s authored by %s\n' "$repo" "$me"
+
+    # Multiple GitHub remotes is the cause nobody suspects. gh picks ONE to
+    # query, and its precedence is not "origin wins" — a fork remote can beat
+    # origin — so a repo that was renamed (old name still on origin, new name
+    # added as another remote) silently answers for the wrong one. Naming
+    # every remote alongside the repo gh actually chose makes the mismatch
+    # visible, and `gh repo set-default` is the supported way to pin it.
+    ghremotes="$(git remote -v 2>/dev/null | awk '/\(fetch\)/ && /github\.com/ {print $1"→"$2}')"
+    nremotes="$(printf '%s' "$ghremotes" | grep -c . || true)"
+    if [ "${nremotes:-0}" -gt 1 ]; then
+      printf '  %s%s GitHub remotes here, and gh queried %s:%s\n' "$_dim" "$nremotes" "$repo" "$_off"
+      printf '%s\n' "$ghremotes" | sed "s/^/    ${_dim}/;s/\$/${_off}/"
+      printf '  %spin the right one: gh repo set-default <owner/repo>%s\n' "$_dim" "$_off"
+    fi
+
+    if [ -n "$others" ]; then
+      printf '  %sbut this repo has open PRs by: %s%s\n' "$_dim" "$others" "$_off"
+      case ", $others ," in
+        *", $me ,"*)
+          # You appear in that list, so --author @me should have matched and
+          # didn't. The two calls can only disagree about WHICH repo they hit,
+          # which happens when origin points somewhere unexpected (a fork, an
+          # ssh alias) — worth naming, because the account looks right and so
+          # nobody thinks to check the remote.
+          printf '  %s...including you, so the author filter should have matched.%s\n' "$_dim" "$_off"
+          printf '  %sorigin may not be the repo you think — check: git remote -v%s\n' "$_dim" "$_off"
+          ;;
+        *) printf '  %sgh is acting as %s here — check: gh auth status%s\n' "$_dim" "$me" "$_off" ;;
+      esac
+    fi
+  fi
+  if [ "$copy" = 1 ] && [ -n "$listing" ]; then
+    printf '%s\n' "$listing" | pbcopy
+    printf '%s✓%s %s\n' "$_ok" "$_off" "copied to clipboard" >&2
+  fi
+  exit 0
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
+# An argument: check out that PR, updated to its latest.
+# ══════════════════════════════════════════════════════════════════════════
+# Resolve the PR from the id (number, branch, or URL) first — this gives us the
+# PR number + head branch, and doubles as the online/offline signal.
+info=$(gh pr view "$id" --json number,headRefName -q '"\(.number) \(.headRefName)"' 2>/dev/null || true)
+
+if [ -n "$info" ]; then
+  num=${info%% *}; branch=${info#* }
+  # A branch already checked out in another worktree can't be checked out
+  # here too (a hard git rule) — `gh pr checkout` fails on it exactly like it
+  # fails on a merged PR's deleted head branch, so without freeing it first
+  # the code below would misdiagnose this as "gone from origin" and try a
+  # fetch/switch that's equally doomed, ending in a confusing "may have
+  # diverged" error for a branch that's actually fine, just in use
+  # somewhere else. Freeing it (detaching that worktree's HEAD — safe, its
+  # working tree is untouched) means checkout just works normally below.
+  free_branch_from_other_worktree "$branch" || exit 1
+  # If that stashed the other worktree's uncommitted changes, guarantee
+  # they're never silently stranded by an unexpected failure below (e.g. the
+  # bare `git switch` a few lines down, unguarded under `set -e`):
+  # apply_freed_worktree_stash() clears the marker once it's dealt with them,
+  # so this only fires for a genuinely unhandled exit.
+  _warn_if_stash_stranded() {
+    if [ -n "${_freed_worktree_stash:-}" ]; then
+      warn "the other worktree's uncommitted changes are still stashed, unapplied — see: git stash list"
+    fi
+  }
+  trap _warn_if_stash_stranded EXIT
+  # gh pr checkout creates the branch or fast-forwards an existing one, leaving
+  # us on it.
+  if gh pr checkout "$id" >/dev/null 2>&1; then
+    # The checkout itself succeeded regardless of what happens next — say so
+    # either way. A failed stash application (conflict) is real, but it must
+    # not read as "the checkout failed": under `set -e` a bare failing call
+    # here would abort before the step line ever printed, leaving you
+    # thinking the checkout itself didn't happen when it did.
+    stash_ok=1
+    apply_freed_worktree_stash || stash_ok=0
+    git config "branch.$branch.gitplus-pr" "$num" 2>/dev/null || true
+    step "switched to $branch ${_dim}(PR #$num, up to date)${_off}"
+    [ "$stash_ok" = 1 ] || exit 1
+    exit 0
+  fi
+  # Resolved the PR but checkout failed — usually a merged/closed PR whose head
+  # branch was deleted from origin. Use the ref GitHub keeps around.
+  warn "head branch gone from origin — using refs/pull/$num/head"
+  stash_ok=1
+  if git fetch --quiet origin "refs/pull/$num/head:$branch" 2>/dev/null; then
+    git switch --quiet "$branch"
+    apply_freed_worktree_stash || stash_ok=0
+    git config "branch.$branch.gitplus-pr" "$num" 2>/dev/null || true
+    step "switched to $branch ${_dim}(PR #$num)${_off}"
+  else
+    echo "gp pr: couldn't check out PR #$num — '$branch' may have diverged; resolve by hand" >&2
+    exit 1
+  fi
+  [ "$stash_ok" = 1 ] || exit 1
+  exit 0
+fi
+
+# gh couldn't resolve $id (GitHub unreachable, or no PR for it). Fall back to a
+# local branch: the stamped one for a number, or the named branch itself.
+if printf '%s' "$id" | grep -qE '^[0-9]+$'; then
+  stamped=$(git config --get-regexp '^branch\..*\.gitplus-pr$' 2>/dev/null \
+    | awk -v n="$id" '$2 == n { print $1; exit }' \
+    | sed -E 's/^branch\.(.*)\.gitplus-pr$/\1/') || true
+  if [ -n "${stamped:-}" ] && git show-ref --verify --quiet "refs/heads/$stamped"; then
+    git switch --quiet "$stamped"
+    warn "couldn't reach GitHub — on existing $stamped (not updated)"
+    exit 0
+  fi
+  echo "gp pr: couldn't find PR #$id (offline, or not a PR in this repo)" >&2; exit 1
+elif git show-ref --verify --quiet "refs/heads/$id"; then
+  git switch --quiet "$id"
+  warn "couldn't resolve a PR for '$id' via gh — switched to local branch as-is"
+  exit 0
+else
+  echo "gp pr: couldn't resolve '$id' to a PR or local branch" >&2; exit 1
+fi

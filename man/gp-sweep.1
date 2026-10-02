@@ -1,0 +1,111 @@
+.TH GP-SWEEP 1 "2026-07-07" "gitplus" "gitplus Manual"
+.SH NAME
+gp-sweep \- delete local branches already merged into the base branch
+.SH SYNOPSIS
+.B gp sweep
+.RI [ BRANCH " ...]"
+[\fB\-r\fR|\fB\-\-remote\fR]
+[\fB\-l\fR|\fB\-\-local\fR]
+[\fB\-f\fR|\fB\-\-force\fR]
+[\fB\-b\fR|\fB\-\-base\fR \fINAME\fR]
+[\fB\-n\fR|\fB\-\-dry\-run\fR]
+[\fB\-h\fR|\fB\-\-help\fR]
+.SH DESCRIPTION
+Delete local branches already merged into the base branch. It fetches first and
+compares against the base's remote tip
+.RI ( origin/<base> ),
+so it works without pulling the base locally and from any branch you are on \(em
+a branch merged upstream is swept even if your local base is stale.
+.PP
+Safe by default: it only deletes a branch whose tip is already an ancestor of
+the base's remote tip (verified with
+.BR "git merge-base \-\-is-ancestor" ),
+so no unmerged work is lost. It deliberately avoids a bare
+.BR "git branch \-d" ,
+which rechecks mergedness against your current branch and so wrongly refuses
+branches merged upstream when the local base is stale.
+.PP
+Squash- and rebase-merged branches are caught as well, despite not being
+ancestors of the base (a squash is one new commit; a rebase rewrites them).
+When the ancestor test says no, GitHub is asked whether a pull request from
+that branch into
+.B this
+base was merged \(em one API call for the whole repository, not one per
+branch. Without it, a repository that squash-merges could never sweep
+anything. The base match matters: a stacked PR merged into its
+.B parent
+branch has not reached the base, and is correctly left alone. Requires
+.BR gh ;
+offline it falls back to the ancestor test only.
+.PP
+Naming one or more branches sweeps just those instead of the whole repo. The
+same safety rule applies: a named branch is skipped unless it's merged into
+the base, unless
+.B \-\-force
+is given. Refuses to name the base or the current branch.
+.SH OPTIONS
+.TP
+.I BRANCH " ..."
+Sweep just the given branch(es) instead of the whole repo.
+.TP
+.BR \-r ", " \-\-remote
+Sweep branches on
+.I origin
+instead of local ones, under the same merged-into-base rule \(em judged
+against
+.IR origin/<branch> ,
+since the local copy may be stale or absent entirely. Deletes are batched
+into a single push, falling back to one at a time only if the batch fails,
+so one protected branch cannot take the whole sweep down with it.
+.B "This is shared state:"
+combined with
+.B \-\-force
+it deletes
+.B unmerged
+branches from the remote, where a mistake affects everyone rather than being
+recoverable from your own reflog. Preview with
+.B \-n
+first.
+.TP
+.BR \-l ", " \-\-local
+Sweep local branches \(em the default, spelled out. Given with
+.B \-r
+.RB ( "or as " \-rl ),
+both sides are swept. The value-less short flags bundle, so
+.BR \-rln ,
+.B "\-r \-l \-n"
+and
+.B "\-rl \-n"
+are the same thing.
+.TP
+.BR \-f ", " \-\-force
+Target every local branch except the base and the current one and force-delete
+with
+.BR "git branch \-D" .
+This also clears never-PR'd and squash-merged leftovers.
+.B "It deletes unmerged work"
+\(em preview with
+.B \-n
+first.
+.TP
+.BR \-b ", " \-\-base " " \fINAME\fR
+Base branch to compare against instead of origin's default.
+.TP
+.BR \-n ", " \-\-dry\-run
+List what would be deleted without changing anything.
+.TP
+.BR \-h ", " \-\-help
+Show usage and exit.
+.SH EXAMPLES
+.TP
+.B gp sweep
+Delete local branches merged into the base (safe).
+.TP
+.B gp sweep \-f \-n
+Preview a force sweep of every local branch.
+.SH SEE ALSO
+.BR gp-wsweep (1),
+.BR gp-sync (1),
+.BR gp-pr (1),
+.BR gp-done (1),
+.BR git-branch (1)

@@ -1,0 +1,10 @@
+#autoload
+#
+# Short words already used in this repo's existing branch names (split on -
+# and /), for cycling through with `git new <TAB>` instead of typing a
+# sentence — real precedent, not a generated suggestion.
+_gitplus_branches \
+  | grep -vE '^(main|master|HEAD)$' \
+  | tr '/-' '\n\n' \
+  | grep -vE '^[0-9]*$' \
+  | sort -u

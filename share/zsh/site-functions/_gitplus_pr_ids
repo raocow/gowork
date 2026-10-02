@@ -1,0 +1,13 @@
+#autoload
+#
+# Open PRs (as "NUM -- title") + branch names, for commands that take EITHER
+# as a target — i.e. `git sync`, where you routinely sync a plain branch.
+# `git pr` deliberately uses _gitplus_pr_nums instead (PRs only): it's about
+# picking a PR, so the full branch list there is just noise. _wanted gives
+# each group a styleable header (see _gitplus_pr_nums).
+_gitplus_pr_nums
+local -a branches
+branches=(${(f)"$(_gitplus_branches)"})
+(( $#branches )) || return
+local expl
+_wanted branch-names expl 'Branches' compadd -a branches
