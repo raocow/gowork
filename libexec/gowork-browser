@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# gw browser — open GitHub links in the browser profile signed in to the right
-# account.
+# gw browser — open GitHub links in the browser (or Chrome profile) signed in
+# to the right account.
 #
 #   gw browser setup          pick a Chrome profile per account, write the rules
 #   gw browser sync           rewrite the rules from current bindings (no questions)
@@ -34,19 +34,42 @@ CHROME="Google Chrome"
 
 die() { echo "gw browser: $*" >&2; exit 1; }
 
-# Chrome profiles as "<dir>\t<display name>", from Chrome's own Local State.
-chrome_profiles() {
-  [ -r "$LOCAL_STATE" ] || return 0
-  perl -MJSON::PP -e '
-    local $/; my $d = JSON::PP->new->decode(<STDIN>);
-    my $c = $d->{profile}{info_cache} || {};
-    print "$_\t$c->{$_}{name}\n" for sort keys %$c;
-  ' < "$LOCAL_STATE"
+# Where a link can go, one "<browser>\t<profile dir>\t<profile name>" per line:
+# each Chrome profile (read from Chrome's Local State), then every other
+# browser installed, whole ("-" for no profile). Some browsers — Island, for
+# one — keep their settings encrypted, so their profiles can't be listed;
+# they're offered as the app itself.
+OTHER_BROWSERS=("Island" "Safari" "Firefox" "Arc" "Brave Browser" "Microsoft Edge" "Vivaldi" "Orion" "Zen" "Chromium")
+choices() {
+  if [ -r "$LOCAL_STATE" ]; then
+    perl -MJSON::PP -e '
+      local $/; my $d = eval { JSON::PP->new->decode(<STDIN>) } or exit 0;
+      my $c = $d->{profile}{info_cache} || {};
+      print "Google Chrome\t$_\t$c->{$_}{name}\n" for sort keys %$c;
+    ' < "$LOCAL_STATE" || true
+  fi
+  local b
+  for b in "${OTHER_BROWSERS[@]}"; do
+    if [ -d "${GOWORK_APPS:-/Applications}/$b.app" ] || [ -d "$HOME/Applications/$b.app" ]; then
+      printf '%s\t-\t-\n' "$b"
+    fi
+  done
 }
 
-map_get() {  # map_get <account> -> "<dir>\t<name>"
-  [ -f "$MAP" ] || return 1
-  awk -F'\t' -v a="$1" '$1 == a { print $2 "\t" $3; found = 1; exit } END { exit !found }' "$MAP"
+label() {  # label <browser> <dir> <profile> -> what to show a person
+  if [ "$2" = "-" ]; then echo "$1"; else echo "$1 — $3"; fi
+}
+
+# The saved map, normalized to "<account>\t<browser>\t<dir>\t<profile>".
+# Lines written before other browsers were supported had three fields
+# (account, Chrome profile dir, profile name).
+map_rows() {
+  [ -f "$MAP" ] || return 0
+  awk -F'\t' -v c="$CHROME" 'NF == 3 { print $1 "\t" c "\t" $2 "\t" $3; next } NF >= 4 { print $1 "\t" $2 "\t" $3 "\t" $4 }' "$MAP"
+}
+
+map_get() {  # map_get <account> -> "<browser>\t<dir>\t<profile>"
+  map_rows | awk -F'\t' -v a="$1" '$1 == a && !f { print $2 "\t" $3 "\t" $4; f = 1 } END { exit !f }'
 }
 
 # Read `gp-account list` once. Piping it straight into an awk that stops at its
@@ -87,6 +110,11 @@ owners_of() {
 
 js_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
 
+browser_js() {  # browser_js <browser> <dir> <profile> -> a Finicky browser value
+  if [ "$2" = "-" ]; then printf '{ name: %s }' "$(js_str "$1")"
+  else printf '{ name: %s, profile: %s }' "$(js_str "$1")" "$(js_str "$3")"; fi
+}
+
 # Write ~/.finicky.js from the saved account -> profile map.
 sync() {
   [ -f "$MAP" ] || die "not set up — run: gw browser setup"
@@ -94,10 +122,13 @@ sync() {
     cp "$FINICKY_CONF" "$FINICKY_CONF.gowork-bak"
     echo "kept your previous ${FINICKY_CONF/#$HOME/~} as ${FINICKY_CONF/#$HOME/~}.gowork-bak"
   fi
-  local def a dir name o rules="" taken="" claimed defjs
-  def="$(map_get default 2>/dev/null | cut -f2 || true)"
-  if [ -n "$def" ]; then defjs="chrome($(js_str "$def"))"; else defjs="$(js_str "$CHROME")"; fi
-  while IFS=$'\t' read -r a dir name; do
+  local a b dir prof o rules="" taken="" claimed defjs m
+  if m="$(map_get default 2>/dev/null)"; then
+    IFS=$'\t' read -r b dir prof <<< "$m"; defjs="$(browser_js "$b" "$dir" "$prof")"
+  else
+    defjs="$(js_str "$CHROME")"
+  fi
+  while IFS=$'\t' read -r a b dir prof; do
     [ "$a" = default ] && continue
     while IFS= read -r o; do
       # An owner two accounts can both see (a shared org) goes to the first
@@ -109,23 +140,21 @@ sync() {
       fi
       taken="$taken$(printf '%s' "$o" | tr 'A-Z' 'a-z')	$a
 "
-      rules="$rules    $(js_str "$(printf '%s' "$o" | tr 'A-Z' 'a-z')"): $(js_str "$name"),
+      rules="$rules    $(js_str "$(printf '%s' "$o" | tr 'A-Z' 'a-z')"): $(browser_js "$b" "$dir" "$prof"),
 "
     done < <(owners_of "$a")
-  done < "$MAP"
+  done < <(map_rows)
 
   local tmp; tmp="$(mktemp "$FINICKY_CONF.gowork.XXXXXX")"
   cat > "$tmp" <<EOF
 $MARK
-// Source: ~/.config/rigor/browser (account -> Chrome profile) and gowork's
-// account bindings. To change it: gw browser setup, or gw browser sync after
-// binding new repos.
+// Source: ~/.config/rigor/browser (account -> browser and profile) and
+// gowork's account bindings. To change it: gw browser setup, or gw browser
+// sync after binding new repos.
 
-// GitHub owner (user or org, lowercased) -> Chrome profile name.
+// GitHub owner (user or org, lowercased) -> where its pages open.
 const owners = {
 ${rules}};
-
-const chrome = (profile) => ({ name: $(js_str "$CHROME"), profile });
 
 export default {
   defaultBrowser: ${defjs},
@@ -136,7 +165,7 @@ export default {
         const owner = url.pathname.split("/")[1]?.toLowerCase();
         return Boolean(owner && owners[owner]);
       },
-      browser: (url) => chrome(owners[url.pathname.split("/")[1].toLowerCase()]),
+      browser: (url) => owners[url.pathname.split("/")[1].toLowerCase()],
     },
   ],
 };
@@ -154,12 +183,13 @@ setup() {
     case "$ans" in y|Y|yes) brew install --cask finicky ;; *) die "Finicky is needed; nothing changed" ;; esac
   fi
   exec 3<&0    # answers come from the terminal; the loops below own stdin
-  local profiles; profiles="$(chrome_profiles)"
-  [ -n "$profiles" ] || die "no Chrome profiles found ($LOCAL_STATE)"
+  local profiles; profiles="$(choices)"
+  [ -n "$profiles" ] || die "no browsers found (looked for Chrome profiles and ${OTHER_BROWSERS[*]})"
 
-  echo "Chrome profiles:"
-  local i=0 line; while IFS= read -r line; do i=$((i + 1)); printf '  %d) %s\n' "$i" "${line#*	}"; done <<< "$profiles"
-  pick() {  # pick <prompt> -> "<dir>\t<name>" or empty
+  echo "Where links can open:"
+  local i=0 line b d p
+  while IFS=$'\t' read -r b d p; do i=$((i + 1)); printf '  %d) %s\n' "$i" "$(label "$b" "$d" "$p")"; done <<< "$profiles"
+  pick() {  # pick <prompt> -> "<browser>\t<dir>\t<profile>" or empty
     # The prompt goes to stderr: pick runs inside $(…), which captures stdout.
     local n; printf '%s ' "$1" >&2; read -r n <&3 || n=""
     [ -n "$n" ] || return 0
@@ -171,10 +201,10 @@ setup() {
   while IFS= read -r a; do
     [ -n "$a" ] || continue
     u="$(ghuser_of "$a")"
-    choice="$(pick "Which profile is signed in to GitHub as ${u:-$a}? (number, Enter to skip)")"
+    choice="$(pick "Where are you signed in to GitHub as ${u:-$a}? (number, Enter to skip)")"
     [ -n "$choice" ] && printf '%s\t%s\n' "$a" "$choice" >> "$tmp"
   done < <(accounts)
-  choice="$(pick "Which profile should every other link open in? (number, Enter for Chrome's own choice)")"
+  choice="$(pick "Where should every other link open? (number, Enter for Chrome's own choice)")"
   [ -n "$choice" ] && printf 'default\t%s\n' "$choice" >> "$tmp"
   mkdir -p "$(dirname "$MAP")"
   mv "$tmp" "$MAP"
@@ -192,8 +222,8 @@ status() {
   else
     echo "rules     : ${FINICKY_CONF/#$HOME/~} is not gowork's — run: gw browser sync"
   fi
-  local a dir name
-  while IFS=$'\t' read -r a dir name; do printf '  %-14s -> %s\n' "$a" "$name"; done < "$MAP"
+  local a b dir prof
+  while IFS=$'\t' read -r a b dir prof; do printf '  %-14s -> %s\n' "$a" "$(label "$b" "$dir" "$prof")"; done < <(map_rows)
 }
 
 off() {
@@ -212,11 +242,12 @@ off() {
 # open <account> <url> — straight into the account's profile, no Finicky
 # needed. Falls back to the default browser when there's no mapping.
 open_as() {
-  local a="${1:-}" url="${2:-}" m dir
+  local a="${1:-}" url="${2:-}" m b dir prof
   [ -n "$url" ] || die "usage: gw browser open <account> <url>"
   if m="$(map_get "$a" 2>/dev/null)"; then
-    dir="${m%%	*}"
-    exec ${GOWORK_OPEN:-open} -na "$CHROME" --args --profile-directory="$dir" "$url"
+    IFS=$'\t' read -r b dir prof <<< "$m"
+    if [ "$dir" = "-" ]; then exec ${GOWORK_OPEN:-open} -a "$b" "$url"; fi
+    exec ${GOWORK_OPEN:-open} -na "$b" --args --profile-directory="$dir" "$url"
   fi
   exec ${GOWORK_OPEN:-open} "$url"
 }

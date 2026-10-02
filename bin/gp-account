@@ -441,8 +441,10 @@ _acct_repo_access() {
   local alias slug out
   alias="$(_acct_alias "$1")"
   slug="$(_acct_test_repo "$1")" || return 0
+  # git's ref advertisement carries a NUL before its capabilities; drop it, or
+  # bash warns about it on every check.
   out="$("$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=10 "git@$alias" \
-         "git-upload-pack '$slug.git'" </dev/null 2>&1)" || true
+         "git-upload-pack '$slug.git'" </dev/null 2>&1 | tr -d '\000')" || true
   case "$out" in
     *refs/heads/*|*" HEAD"*) return 0 ;;
     *"Could not resolve"*|*"timed out"*|*"Broken pipe"*|*"Connection refused"*) return 2 ;;
