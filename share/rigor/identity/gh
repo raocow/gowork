@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+#
+# rigor identity: gh shim — run the real gh as the GitHub account bound to
+# $PWD.
+#
+# gh's "active account" is one machine-wide setting, so an agent (or any
+# non-interactive shell) that never ran gitplus' ghswitch.zsh hook talks to
+# GitHub as whichever account was last switched to. This resolves the binding
+# from `gp account` on every call instead, so it holds in agents, git's
+# credential helper, scripts and IDEs alike — anything that finds gh on PATH.
+#
+# An explicit GH_TOKEN/GITHUB_TOKEN always wins (gp-account's own per-account
+# probes rely on that), `gh auth login/logout/switch/refresh` are passed
+# through untouched since gh refuses them with GH_TOKEN set, and
+# RIGOR_IDENTITY_OFF=1 disables the lookup. Without gitplus installed this is
+# a plain passthrough.
+#
+# RIGOR_IDENTITY_RESOLVE=1 prints the account it would use and exits, for
+# `rigor identity status`.
+
+# Two wrappers that each look for "the next gh on PATH" find each other
+# and exec back and forth forever, so skip anything that calls itself a gh
+# shim (another copy of this one, an older hand-rolled one), and give up after
+# a few hops in case some other wrapper does the same.
+if (( ${_RIGOR_SHIM_HOPS:-0} >= 8 )); then
+  echo "rigor identity: gh shims are calling each other — check: which -a gh" >&2
+  exit 127
+fi
+export _RIGOR_SHIM_HOPS=$(( ${_RIGOR_SHIM_HOPS:-0} + 1 ))
+
+_is_shim() {
+  local magic line n=0
+  IFS= read -r -n 2 magic <"$1" 2>/dev/null || return 1
+  [[ "$magic" == "#!" ]] || return 1
+  while IFS= read -r line && (( n++ < 6 )); do
+    [[ "$line" == *"gh shim"* ]] && return 0
+  done <"$1"
+  return 1
+}
+
+self="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+real=""
+IFS=: read -ra _dirs <<<"$PATH"
+for d in "${_dirs[@]}"; do
+  c="$d/gh"
+  [[ -x "$c" && ! -d "$c" ]] || continue
+  [[ "$c" -ef "$self" ]] && continue
+  _is_shim "$c" && continue
+  real="$c"; break
+done
+[[ -n "$real" ]] || real=/opt/homebrew/bin/gh
+
+resolve=""
+if [[ -n "${RIGOR_IDENTITY_RESOLVE:-}" ]]; then
+  resolve=1
+else
+  case "${1:-} ${2:-}" in
+    "auth login"*|"auth logout"*|"auth switch"*|"auth refresh"*) exec "$real" "$@" ;;
+  esac
+fi
+
+want=""
+if [[ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}${RIGOR_IDENTITY_OFF:-}${_RIGOR_GH_SHIM:-}" ]] \
+   && command -v gp-account >/dev/null 2>&1; then
+  # gp-account calls gh itself; the guard keeps that from re-entering here.
+  want="$(_RIGOR_GH_SHIM=1 gp-account _gh-for-dir "$PWD" 2>/dev/null)"
+fi
+
+if [[ -n "$resolve" ]]; then
+  if [[ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]]; then echo "env"
+  elif [[ -n "$want" ]]; then echo "$want"
+  fi
+  exit 0
+fi
+
+if [[ -n "$want" ]]; then
+  tok="$("$real" auth token --user "$want" 2>/dev/null)"
+  [[ -n "$tok" ]] && export GH_TOKEN="$tok"
+fi
+
+exec "$real" "$@"

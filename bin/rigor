@@ -32,7 +32,8 @@ Usage:
   rigor init [feature...]        Print the raw source line(s) — for eval or manual use
   rigor sleep on|off|status      Toggle 'sudo pmset -a disablesleep' (needs sudo)
   rigor push <subcommand>        Agent turn notifications on your phone
-  rigor version                  Print version
+  rigor identity <subcommand>    Per-directory gh account + AWS profile, for agents too
+  rigor version                 Print version
   rigor help                     Show this help
 
 Features:
@@ -51,6 +52,14 @@ Push subcommands:
   push status [--show]            What is wired, and where
   push test [message]             Send one notification and read it back
   push off                        Unwire, restoring what was there before
+
+Identity subcommands:
+  identity setup                  Install gh/aws shims and put them on PATH
+  identity status                 What's wired, and what applies in this dir
+  identity bind <profile> [dir]   Use that AWS profile in dir and below
+  identity unbind [dir]           Drop a directory's AWS binding
+  identity off                    Unwire, restoring what was there before
+  (gh accounts are bound with gitplus: gp account bind <name> <dir>)
 
 Example:
   rigor enable autovenv      # then: exec zsh
@@ -577,6 +586,327 @@ EOF
   esac
 }
 
+# --- identity ----------------------------------------------------------------
+# Per-directory gh account and AWS profile, applied by gh/aws shims on PATH
+# rather than by a shell hook. A hook only runs in interactive shells, and
+# agents (Claude Code, Codex), git's credential helper and scripts never get
+# one — so they fall back to gh's one machine-wide active account and AWS's
+# [default], and end up telling you to log in as somebody else. A shim is
+# consulted by every process that finds gh/aws on PATH.
+IDENT_BIN="${RIGOR_IDENTITY_BIN:-$HOME/.local/share/rigor/identity/bin}"
+IDENT_MAP="${RIGOR_AWS_PROFILES:-$HOME/.config/rigor/aws-profiles}"
+IDENT_GIT_SAVE="${RIGOR_IDENTITY_GIT_SAVE:-$HOME/.config/rigor/identity-git-helpers}"
+IDENT_MARK="# rigor:identity"
+# Both files, on purpose: .zshenv is the only one non-interactive `zsh -c`
+# reads (what agents run), but on macOS /etc/zprofile runs path_helper after
+# it in login shells, which moves /usr/local/bin and friends back in front —
+# so the shim dir is re-prepended from .zprofile too.
+IDENT_ZSHENV="${RIGOR_ZSHENV:-${ZDOTDIR:-$HOME}/.zshenv}"
+IDENT_ZPROFILE="${RIGOR_ZPROFILE:-${ZDOTDIR:-$HOME}/.zprofile}"
+# Claude Code's Bash sandbox hides the keychain and the network from gh, aws
+# and git, so the shims alone can't help a sandboxed agent; setup also lists
+# those commands in sandbox.excludedCommands.
+IDENT_CLAUDE="${RIGOR_IDENTITY_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
+IDENT_CLAUDE_REC="${RIGOR_IDENTITY_CLAUDE_RECORD:-$HOME/.config/rigor/identity-claude-excluded}"
+
+# Same preference as share_dir(), except a Homebrew keg older than this
+# feature has no identity/ yet — fall back to wherever this script lives.
+_ident_src() {
+  local sd; sd="$(share_dir)"
+  if [ -x "$sd/identity/gh" ]; then echo "$sd/identity"; else echo "$SHARE/identity"; fi
+}
+
+_ident_path_line() {
+  # ${path:#dir} drops an existing copy, so this moves the dir to the front
+  # instead of skipping when path_helper has already pushed it back.
+  printf '[ -d "%s" ] && path=("%s" ${path:#%s})  %s\n' \
+    "$IDENT_BIN" "$IDENT_BIN" "$IDENT_BIN" "$IDENT_MARK"
+}
+
+_ident_pattern() {  # a directory as it's written in the map: ~-relative when possible
+  # Normalized the same way `pwd` normalized $1 (a HOME with a trailing or
+  # doubled slash would otherwise never prefix-match).
+  local h; h="$(cd "$HOME" 2>/dev/null && pwd)" || h="$HOME"
+  case "$1" in
+    "$h"|"$h"/*) echo "~${1#"$h"}" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# Point any `gh auth git-credential` helper in the global git config at the
+# shim, so HTTPS pushes authenticate as the directory's account too. The
+# originals are saved for `off` to put back.
+_ident_git_route() {
+  command -v git >/dev/null 2>&1 || return 0
+  local key val n=0 found=0
+  while read -r key val; do
+    case "$val" in
+      *"$IDENT_BIN/gh "*) found=1; continue ;;
+      "!"*"gh auth git-credential") ;;
+      *) continue ;;
+    esac
+    mkdir -p "$(dirname "$IDENT_GIT_SAVE")"
+    printf '%s\t%s\n' "$key" "$val" >>"$IDENT_GIT_SAVE"
+    git config --global --replace-all "$key" "!$IDENT_BIN/gh auth git-credential" \
+      '^!.*gh auth git-credential$'
+    n=$((n + 1))
+  done < <(git config --global --get-regexp '^credential\..*\.helper$' 2>/dev/null || true)
+  if [ "$n" -gt 0 ]; then
+    echo "git       : $n credential helper(s) now go through the gh shim"
+  elif [ "$found" = 1 ]; then
+    echo "git       : credential helper already goes through the gh shim"
+  else
+    echo "git       : no gh credential helper configured — left alone"
+  fi
+}
+
+_ident_git_restore() {
+  [ -f "$IDENT_GIT_SAVE" ] || return 0
+  local key val
+  while IFS=$'\t' read -r key val; do
+    [ -n "$key" ] || continue
+    git config --global --replace-all "$key" "$val" 'rigor/identity/bin/gh auth git-credential'
+  done <"$IDENT_GIT_SAVE"
+  rm -f "$IDENT_GIT_SAVE"
+  echo "git       : credential helper(s) restored"
+}
+
+_ident_claude_on() {
+  # No Claude Code here: nothing to wire, and creating its settings file would
+  # be presumptuous.
+  [ -d "$(dirname "$IDENT_CLAUDE")" ] || return 0
+  local n
+  mkdir -p "$(dirname "$IDENT_CLAUDE_REC")"
+  _push_backup "$IDENT_CLAUDE"
+  if n="$("$(_ident_src)/wire-claude" on "$IDENT_CLAUDE" "$IDENT_CLAUDE_REC")"; then
+    if [ "$n" -gt 0 ]; then
+      echo "claude    : $n command pattern(s) let out of the Bash sandbox (gh, aws, git network)"
+    else
+      echo "claude    : gh, aws and git network commands already outside the sandbox"
+    fi
+  else
+    echo "claude    : not changed — see the error above" >&2
+  fi
+}
+
+_ident_claude_off() {
+  [ -f "$IDENT_CLAUDE_REC" ] && [ -f "$IDENT_CLAUDE" ] || return 0
+  local n
+  _push_backup "$IDENT_CLAUDE"
+  if n="$("$(_ident_src)/wire-claude" off "$IDENT_CLAUDE" "$IDENT_CLAUDE_REC")"; then
+    echo "claude    : removed the $n sandbox exclusion(s) setup added"
+  fi
+}
+
+_ident_setup() {
+  local src; src="$(_ident_src)"
+  if [ ! -x "$src/gh" ] || [ ! -x "$src/aws" ]; then
+    echo "rigor identity: shims not found in $src" >&2
+    return 1
+  fi
+  mkdir -p "$IDENT_BIN"
+  ln -sfn "$src/gh" "$IDENT_BIN/gh"
+  ln -sfn "$src/aws" "$IDENT_BIN/aws"
+  echo "shims     : ${IDENT_BIN/#$HOME/~} (gh, aws)"
+
+  local f
+  for f in "$IDENT_ZSHENV" "$IDENT_ZPROFILE"; do
+    if [ -f "$f" ] && grep -qF "$IDENT_MARK" "$f"; then
+      echo "path      : already in ${f/#$HOME/~}"
+      continue
+    fi
+    _push_backup "$f"
+    _ident_path_line >>"$f"
+    echo "path      : prepended from ${f/#$HOME/~}"
+  done
+
+  _ident_git_route
+  _ident_claude_on
+
+  if [ ! -f "$IDENT_MAP" ]; then
+    mkdir -p "$(dirname "$IDENT_MAP")"
+    cat >"$IDENT_MAP" <<'EOF'
+# <dir-glob> <aws profile> — read by rigor's aws shim. First match wins, so
+# specific directories go above their parents; `rigor identity bind` keeps
+# that order. A directory matches itself and everything below it.
+EOF
+    echo "aws map   : created ${IDENT_MAP/#$HOME/~}"
+  fi
+
+  # The shims pick the right account; this makes sure that account's ssh key
+  # actually works. A refused key needs one browser approval to fix, so only
+  # with someone at the terminal — otherwise say what to run.
+  if command -v gp-account >/dev/null 2>&1; then
+    echo
+    if [ -t 0 ] && [ -t 1 ]; then
+      echo "Checking each account's ssh key with GitHub (gp account check --fix):"
+      gp-account check --fix || true
+    else
+      echo "ssh keys  : not checked (no terminal) — run: gp account check --fix"
+    fi
+  fi
+
+  echo
+  echo "Bind directories:  rigor identity bind <aws-profile> [dir]"
+  echo "                   gp account bind <name> <dir>     (gh, via gitplus)"
+  echo "Then open a new shell (and restart agent apps) and check: rigor identity status"
+}
+
+_ident_resolve() {  # <gh|aws> — what the shim would use in $PWD
+  local s="$IDENT_BIN/$1"
+  [ -x "$s" ] || s="$(_ident_src)/$1"
+  RIGOR_IDENTITY_RESOLVE=1 "$s" 2>/dev/null || true
+}
+
+_ident_status() {
+  local t r
+  if [ -x "$IDENT_BIN/gh" ] && [ -x "$IDENT_BIN/aws" ]; then
+    echo "shims     : ${IDENT_BIN/#$HOME/~}"
+  else
+    echo "not set up — run: rigor identity setup"
+    return 0
+  fi
+  for t in gh aws; do
+    r="$(command -v "$t" 2>/dev/null || true)"
+    if [ -n "$r" ] && [ "$r" -ef "$IDENT_BIN/$t" ]; then
+      printf 'path      : %-3s -> shim\n' "$t"
+    else
+      printf 'path      : %-3s -> %s  (shim not first on PATH — open a new shell)\n' "$t" "${r:-not found}"
+    fi
+  done
+  if git config --global --get-regexp '^credential\..*\.helper$' 2>/dev/null | grep -qF "$IDENT_BIN/gh"; then
+    echo "git       : credential helper via shim"
+  elif git config --global --get-regexp '^credential\..*\.helper$' 2>/dev/null | grep -qF 'gh auth git-credential'; then
+    echo "git       : credential helper bypasses the shim — run: rigor identity setup"
+  fi
+  if [ -f "$IDENT_CLAUDE" ]; then
+    echo "claude    : $("$(_ident_src)/wire-claude" status "$IDENT_CLAUDE" 2>&1)"
+  fi
+
+  echo "here      : ${PWD/#$HOME/~}"
+  r="$(_ident_resolve gh)"
+  case "$r" in
+    env) echo "  gh      : GH_TOKEN/GITHUB_TOKEN from the environment (wins over bindings)" ;;
+    "")  if command -v gp-account >/dev/null 2>&1; then
+           echo "  gh      : unbound — gh's active account (bind: gp account bind <name> <dir>)"
+         else
+           echo "  gh      : gitplus not installed — gh's active account"
+         fi ;;
+    *)   echo "  gh      : $r" ;;
+  esac
+  r="$(_ident_resolve aws)"
+  case "$r" in
+    env) echo "  aws     : AWS_PROFILE/AWS_ACCESS_KEY_ID from the environment (wins over bindings)" ;;
+    "")  echo "  aws     : unbound — [default] (bind: rigor identity bind <profile>)" ;;
+    *)   echo "  aws     : $r" ;;
+  esac
+
+  echo "aws map   : ${IDENT_MAP/#$HOME/~}"
+  if [ -r "$IDENT_MAP" ]; then
+    grep -vE '^[[:space:]]*(#|$)' "$IDENT_MAP" | sed 's/^/  /' || true
+  fi
+}
+
+_ident_bind() {
+  local prof="${1:-}" dir="${2:-$PWD}"
+  if [ -z "$prof" ]; then
+    echo "usage: rigor identity bind <aws-profile> [dir]" >&2
+    return 2
+  fi
+  dir="$(cd "$dir" 2>/dev/null && pwd)" || { echo "rigor identity: no such directory: ${2:-}" >&2; return 1; }
+  if ! RIGOR_IDENTITY_OFF=1 aws configure list-profiles 2>/dev/null | grep -qxF "$prof"; then
+    echo "warning: no AWS profile '$prof' in your aws config — binding it anyway" >&2
+  fi
+  local pat; pat="$(_ident_pattern "$dir")"
+  mkdir -p "$(dirname "$IDENT_MAP")"
+  touch "$IDENT_MAP"
+
+  # Insert above the first entry that already covers this directory (a
+  # parent), so the more specific binding is the one that matches first.
+  local tmp line p e inserted=0
+  tmp="$(mktemp "$IDENT_MAP.rigor.XXXXXX")"
+  while IFS= read -r line || [ -n "$line" ]; do
+    read -r p _ <<<"$line"
+    if [ -n "$p" ] && [ "${p#\#}" = "$p" ]; then
+      [ "$p" = "$pat" ] && continue        # rebinding: the old line goes
+      e="${p/#\~/$HOME}"
+      # shellcheck disable=SC2053  # $e is a glob
+      if [ "$inserted" = 0 ] && [[ "$dir/" == $e/* ]]; then
+        printf '%s %s\n' "$pat" "$prof"
+        inserted=1
+      fi
+    fi
+    printf '%s\n' "$line"
+  done <"$IDENT_MAP" >"$tmp"
+  [ "$inserted" = 1 ] || printf '%s %s\n' "$pat" "$prof" >>"$tmp"
+  mv "$tmp" "$IDENT_MAP"
+  echo "bound $pat -> $prof"
+}
+
+_ident_unbind() {
+  local dir="${1:-$PWD}"
+  dir="$(cd "$dir" 2>/dev/null && pwd)" || dir="${1:-}"
+  local pat; pat="$(_ident_pattern "$dir")"
+  [ -f "$IDENT_MAP" ] || { echo "nothing bound"; return 0; }
+  local tmp line p n=0
+  tmp="$(mktemp "$IDENT_MAP.rigor.XXXXXX")"
+  while IFS= read -r line || [ -n "$line" ]; do
+    read -r p _ <<<"$line"
+    if [ "$p" = "$pat" ]; then n=$((n + 1)); continue; fi
+    printf '%s\n' "$line"
+  done <"$IDENT_MAP" >"$tmp"
+  mv "$tmp" "$IDENT_MAP"
+  if [ "$n" -gt 0 ]; then echo "unbound $pat"; else echo "$pat was not bound"; fi
+}
+
+_ident_off() {
+  local f tmp
+  for f in "$IDENT_ZSHENV" "$IDENT_ZPROFILE"; do
+    [ -f "$f" ] && grep -qF "$IDENT_MARK" "$f" || continue
+    _push_backup "$f"
+    tmp="$(mktemp "$f.rigor.XXXXXX")"
+    grep -vF "$IDENT_MARK" "$f" >"$tmp" || true
+    cat "$tmp" >"$f"     # in place, so a symlinked dotfile stays a symlink
+    rm -f "$tmp"
+    echo "path      : removed from ${f/#$HOME/~}"
+  done
+  _ident_git_restore
+  _ident_claude_off
+  if [ -d "$IDENT_BIN" ]; then
+    rm -rf "$IDENT_BIN"
+    echo "shims     : removed"
+  fi
+  # Bindings are hand-curated and cheap to keep; deleting them would make
+  # off-then-setup lose work.
+  [ -f "$IDENT_MAP" ] && echo "aws map   : kept at ${IDENT_MAP/#$HOME/~}"
+  return 0
+}
+
+cmd_identity() {
+  local sub="${1:-}"
+  [ "$#" -gt 0 ] && shift
+  case "$sub" in
+    setup)  _ident_setup ;;
+    status) _ident_status ;;
+    bind)   _ident_bind "$@" ;;
+    unbind) _ident_unbind "$@" ;;
+    off)    _ident_off ;;
+    *)
+      cat >&2 <<'EOF'
+rigor identity: specify a subcommand
+
+  rigor identity setup                    Install gh/aws shims and put them on PATH
+  rigor identity status                   What's wired, and what applies here
+  rigor identity bind <aws-profile> [dir] Use that AWS profile in dir and below
+  rigor identity unbind [dir]
+  rigor identity off                      Unwire, restoring what was there before
+
+gh accounts are bound with gitplus: gp account bind <name> <dir>.
+EOF
+      return 1 ;;
+  esac
+}
+
 cmd_init() {
   local sd; sd="$(share_dir)"
   local f file
@@ -604,6 +934,7 @@ case "${1:-help}" in
     exit 1 ;;
   sleep)                shift; cmd_sleep "$@" ;;
   push)                 shift; cmd_push "$@" ;;
+  identity|id)          shift; cmd_identity "$@" ;;
   version|--version|-v) echo "rigor $VERSION" ;;
   help|--help|-h)       usage ;;
   *)                    usage >&2; exit 1 ;;

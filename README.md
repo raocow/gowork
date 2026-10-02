@@ -126,6 +126,64 @@ of stacking new ones.
 Needs `curl` and `perl` (both already on macOS). Deliberately not `jq`, so the
 package stays dependency-free for everyone who does not use this feature.
 
+## Identity
+
+Make `gh` and `aws` use the right account for whatever directory they run in —
+in agents too, not just your own terminal.
+
+```bash
+rigor identity setup                     # install the shims, put them on PATH
+rigor identity bind client-dev ~/work/client    # AWS profile for that tree
+gp account bind work ~/work/client       # GitHub account (gitplus)
+rigor identity status                    # what's wired, and what applies here
+rigor identity off                       # unwire; bindings are kept
+```
+
+`gh`'s active account and AWS's `[default]` profile are each one machine-wide
+setting. A shell hook that switches them on `cd` (gitplus' `ghswitch` does this
+for `gh`) only runs in interactive shells, and Claude Code, Codex, git's
+credential helper and scripts never get one — so they talk to GitHub or AWS as
+whoever was last active, and an agent ends up telling you to log in as somebody
+else, or worse, runs `gh auth switch` and changes it for every other session too.
+
+`setup` puts `gh` and `aws` shims first on `PATH`, so the lookup happens on every
+call, in every process:
+
+- **gh** takes the account from your `gp account` bindings and passes it to the
+  real `gh` as `GH_TOKEN` for that one call. gh's global setting is never
+  written. Without gitplus installed it is a plain passthrough.
+- **aws** takes the profile from `~/.config/rigor/aws-profiles` — one
+  `<dir-glob> <profile>` per line, first match wins; `bind` keeps specific
+  directories above their parents. Unbound directories fall through to
+  `[default]` as before.
+- An explicit `GH_TOKEN`, `AWS_PROFILE` or `AWS_ACCESS_KEY_ID` always wins, and
+  `RIGOR_IDENTITY_OFF=1` turns both shims into passthroughs for one command.
+
+`setup` writes one line each to `~/.zshenv` (the only file non-interactive
+`zsh -c` reads, which is what agents run) and `~/.zprofile` (macOS's
+`path_helper` reorders `PATH` in login shells after `.zshenv`), and points any
+`gh auth git-credential` helper in your global git config at the shim so HTTPS
+pushes authenticate as the right account. It also adds `gh *`, `aws *` and git's
+network commands (`push`, `pull`, `fetch`, `clone`, `ls-remote`) to
+`sandbox.excludedCommands` in `~/.claude/settings.json`: inside Claude Code's
+Bash sandbox gh can't read its tokens from the keychain or reach GitHub, so it
+reports every login "invalid" and agents ask you to log in again. Excluded
+commands still go through Claude Code's normal permission prompts. Files are
+backed up (`.rigor-bak`), a settings file that isn't valid JSON is refused rather
+than rewritten, and `off` restores the git helpers and removes only the
+exclusions `setup` added. Restart agent apps afterwards so they pick up
+the new `PATH`.
+
+With gitplus installed, `setup` finishes by running `gp account check --fix`,
+which asks GitHub whether each account's SSH key still works and fixes any
+that don't (one browser approval per account, the first time). Without a
+terminal it prints that command instead.
+
+The shims do not log you in: an expired AWS SSO session still needs
+`aws sso login`. Code that calls AWS through an SDK rather than the `aws` CLI
+does not go through the shim either — set `AWS_PROFILE` in that project's
+environment.
+
 ## Sleep
 
 ```bash

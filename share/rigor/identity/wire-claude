@@ -1,0 +1,90 @@
+#!/usr/bin/env perl
+# rigor identity: let gh, aws and git's network commands out of Claude Code's
+# Bash sandbox.
+#
+#   wire-claude on     <settings.json> <record>
+#   wire-claude off    <settings.json> <record>
+#   wire-claude status <settings.json>
+#
+# Inside the sandbox those commands can't read the macOS keychain (where gh
+# keeps its tokens) or reach GitHub/AWS, so gh reports every login "invalid"
+# and agents ask you to log in again — which can't help. Listing them in
+# sandbox.excludedCommands runs them outside it, still through Claude Code's
+# normal permission flow.
+#
+# `on` adds only the entries that are missing and writes the ones it added to
+# <record>; `off` removes exactly those, so entries you added by hand survive.
+# Decoded and re-encoded rather than patched textually, like push's
+# wire-claude; a file that isn't valid JSON is refused, never rewritten.
+use strict;
+use warnings;
+use JSON::PP;
+
+my @ENTRIES = (
+  'gh *', 'aws *',
+  'git push *', 'git pull *', 'git fetch *', 'git clone *', 'git ls-remote *',
+);
+
+my ($mode, $path, $record) = @ARGV;
+die "usage: wire-claude on|off <settings> <record> | status <settings>\n"
+  unless defined $mode && defined $path
+      && ($mode eq 'status' || (($mode eq 'on' || $mode eq 'off') && defined $record));
+
+my $json = JSON::PP->new->pretty->canonical;
+my $data = {};
+if (-s $path) {
+  open my $fh, '<', $path or die "wire-claude: cannot read $path: $!\n";
+  local $/; my $raw = <$fh>; close $fh;
+  $data = eval { $json->decode($raw) };
+  unless (ref $data eq 'HASH') {
+    (my $why = $@ || 'not a JSON object') =~ s/ at \S+ line \d+\.?\n?$//;
+    die "wire-claude: $path is not valid JSON ($why) — fix it first; refusing to touch it\n";
+  }
+}
+
+my $sandbox = ref $data->{sandbox} eq 'HASH' ? $data->{sandbox} : {};
+my @have = ref $sandbox->{excludedCommands} eq 'ARRAY' ? @{ $sandbox->{excludedCommands} } : ();
+my %have = map { $_ => 1 } @have;
+
+if ($mode eq 'status') {
+  my @missing = grep { !$have{$_} } @ENTRIES;
+  my $enabled = $sandbox->{enabled} ? 'on' : 'off';
+  printf "%d/%d excluded (sandbox %s)%s\n", @ENTRIES - @missing, scalar @ENTRIES, $enabled,
+    @missing ? '; missing: ' . join(', ', map { "\"$_\"" } @missing) : '';
+  exit 0;
+}
+
+my @recorded;
+if (-f $record) {
+  open my $rf, '<', $record or die "wire-claude: cannot read $record: $!\n";
+  chomp(@recorded = grep { /\S/ } <$rf>); close $rf;
+}
+
+my $changed = 0;
+if ($mode eq 'on') {
+  my @added = grep { !$have{$_} } @ENTRIES;
+  if (@added) {
+    push @have, @added; $changed = 1;
+    my %seen = map { $_ => 1 } @recorded;
+    open my $rf, '>>', $record or die "wire-claude: cannot write $record: $!\n";
+    print $rf "$_\n" for grep { !$seen{$_} } @added;
+    close $rf;
+  }
+  print scalar(@added), "\n";
+} else {
+  my %ours = map { $_ => 1 } @recorded;
+  my @kept = grep { !$ours{$_} } @have;
+  my $removed = @have - @kept;
+  if ($removed) { @have = @kept; $changed = 1 }
+  unlink $record;
+  print "$removed\n";
+}
+exit 0 unless $changed;
+
+if (@have) { $sandbox->{excludedCommands} = \@have } else { delete $sandbox->{excludedCommands} }
+if (%$sandbox) { $data->{sandbox} = $sandbox } else { delete $data->{sandbox} }
+
+open my $out, '>', "$path.rigor-tmp" or die "wire-claude: cannot write $path: $!\n";
+print $out $json->encode($data);
+close $out;
+rename "$path.rigor-tmp", $path or die "wire-claude: cannot replace $path: $!\n";

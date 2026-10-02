@@ -106,6 +106,66 @@ hands the slot back.
 .TP
 .B version
 Print the version.
+.TP
+.B identity " setup|status|bind|unbind|off"
+Use the right GitHub account and AWS profile for the directory a command runs
+in, for agents as well as you.
+.BR gh 's
+active account and AWS's
+.B [default]
+profile are each one machine-wide setting, and a shell hook that switches them
+on
+.B cd
+never runs in the non-interactive shells agents, git's credential helper and
+scripts use \(em so those talk to the wrong account.
+.B setup
+installs
+.B gh
+and
+.B aws
+shims, puts their directory first on
+.B PATH
+from
+.I ~/.zshenv
+and
+.I ~/.zprofile
+(the latter because macOS's path_helper reorders
+.B PATH
+in login shells), and routes any
+.B gh auth git-credential
+helper in your global git config through the shim. It also adds
+.BR "gh *" ", " "aws *"
+and git's network commands to
+.I sandbox.excludedCommands
+in
+.IR ~/.claude/settings.json ,
+since Claude Code's Bash sandbox hides the keychain and the network from them;
+a settings file that isn't valid JSON is refused, and
+.B off
+removes only the entries
+.B setup
+added.
+The gh shim takes the account from gitplus'
+.B gp account
+bindings; the aws shim takes the profile from
+.IR ~/.config/rigor/aws-profiles ,
+which
+.B bind
+.I profile
+.RI [ dir ]
+and
+.B unbind
+.RI [ dir ]
+edit. An explicit
+.BR GH_TOKEN ,
+.B AWS_PROFILE
+or
+.B AWS_ACCESS_KEY_ID
+always wins.
+.B status
+shows what is wired and what applies in the current directory;
+.B off
+removes the shims and restores the git helpers, keeping the bindings.
 .SH ENVIRONMENT
 .TP
 .B RIGOR_RC
@@ -184,6 +244,19 @@ Named
 rather than
 .B dotenv
 to avoid shadowing the python-dotenv CLI.
+.TP
+.B RIGOR_IDENTITY_BIN
+Override where
+.B identity
+installs its shims (default
+.IR ~/.local/share/rigor/identity/bin ).
+.TP
+.B RIGOR_AWS_PROFILES
+Override the AWS directory\(->profile map (default
+.IR ~/.config/rigor/aws-profiles ).
+.TP
+.B RIGOR_IDENTITY_OFF
+Set to make the gh and aws shims pass straight through for one command.
 .SH FILES
 .TP
 .I <prefix>/share/rigor/*.zsh
@@ -197,6 +270,11 @@ points Claude Code and Codex at.
 .I ~/.config/rigor/push.env
 Push config, mode 600. On public ntfy.sh the topic name in it is the only thing
 protecting the feed.
+.TP
+.I ~/.config/rigor/aws-profiles
+One
+.RI \(dq dir-glob " " profile \(dq
+per line; first match wins, so specific directories go above their parents.
 .SH EXAMPLES
 Enable features, then reload the shell to apply:
 .PP
@@ -236,6 +314,17 @@ Notify your phone when an agent turn ends, on this machine and then a second one
 rigor push setup                       # prints the topic to subscribe to
 rigor push test                        # confirm it arrives
 rigor push setup --topic TOPIC --device mini   # on the next machine
+.RE
+.fi
+.PP
+Give agents the right GitHub account and AWS profile per directory:
+.PP
+.nf
+.RS
+rigor identity setup                   # shims on PATH, git helper routed
+rigor identity bind client-dev ~/work/client  # AWS profile for that tree
+gp account bind work ~/work/client     # gh account (gitplus)
+rigor identity status                  # what applies here
 .RE
 .fi
 .SH SEE ALSO

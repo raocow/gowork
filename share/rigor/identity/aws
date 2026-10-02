@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+#
+# rigor identity: aws shim — run the real aws CLI with the profile bound to
+# $PWD.
+#
+# Bindings live in ~/.config/rigor/aws-profiles (override with
+# RIGOR_AWS_PROFILES): one "<dir-glob> <profile>" per line, first match wins,
+# so specific directories go above their parents (`rigor identity bind` keeps
+# them in that order). A directory matches itself and everything below it. An
+# explicit AWS_PROFILE or AWS_ACCESS_KEY_ID always wins, RIGOR_IDENTITY_OFF=1
+# disables the lookup, and unbound directories fall through to [default].
+#
+# RIGOR_IDENTITY_RESOLVE=1 prints the profile it would use and exits, for
+# `rigor identity status`.
+
+# Two wrappers that each look for "the next aws on PATH" find each other
+# and exec back and forth forever, so skip anything that calls itself an aws
+# shim (another copy of this one, an older hand-rolled one), and give up after
+# a few hops in case some other wrapper does the same.
+if (( ${_RIGOR_SHIM_HOPS:-0} >= 8 )); then
+  echo "rigor identity: aws shims are calling each other — check: which -a aws" >&2
+  exit 127
+fi
+export _RIGOR_SHIM_HOPS=$(( ${_RIGOR_SHIM_HOPS:-0} + 1 ))
+
+_is_shim() {
+  local magic line n=0
+  IFS= read -r -n 2 magic <"$1" 2>/dev/null || return 1
+  [[ "$magic" == "#!" ]] || return 1
+  while IFS= read -r line && (( n++ < 6 )); do
+    [[ "$line" == *"aws shim"* ]] && return 0
+  done <"$1"
+  return 1
+}
+
+self="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+real=""
+IFS=: read -ra _dirs <<<"$PATH"
+for d in "${_dirs[@]}"; do
+  c="$d/aws"
+  [[ -x "$c" && ! -d "$c" ]] || continue
+  [[ "$c" -ef "$self" ]] && continue
+  _is_shim "$c" && continue
+  real="$c"; break
+done
+[[ -n "$real" ]] || real=/usr/local/bin/aws
+
+map="${RIGOR_AWS_PROFILES:-$HOME/.config/rigor/aws-profiles}"
+prof=""
+if [[ -z "${AWS_PROFILE:-}${AWS_ACCESS_KEY_ID:-}${RIGOR_IDENTITY_OFF:-}" && -r "$map" ]]; then
+  # Physical paths too, on both sides: a process started under a symlinked
+  # path (or with no inherited PWD, where it's always physical) must still
+  # match, and so must a HOME that is itself reached through a symlink.
+  here="$PWD/"
+  phys="$(pwd -P 2>/dev/null)/"
+  home_p="$(cd "$HOME" 2>/dev/null && pwd -P)"
+  # A linked worktree can live anywhere but belongs to its main repository,
+  # so each line is also tried against that; line order still decides, so a
+  # worktree under ~/work/ follows its repo's own entry above a ~/work line.
+  main="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  case "$main" in */.git) main="${main%/.git}/" ;; *) main="" ;; esac
+  while read -r pat p _; do
+    [[ -z "$pat" || "$pat" == \#* || -z "$p" ]] && continue
+    pat_p="${pat/#\~/${home_p:-$HOME}}"
+    pat="${pat/#\~/$HOME}"
+    # Patterns unquoted on purpose: they're globs.
+    if [[ "$here" == $pat/* || "$phys" == $pat/* || "$phys" == $pat_p/* ]] \
+       || [[ -n "$main" && ( "$main" == $pat/* || "$main" == $pat_p/* ) ]]; then
+      prof="$p"; break
+    fi
+    # A plain directory written through a symlink: compare it resolved.
+    if [[ "$pat" != *[\*?[]* && -d "$pat" ]]; then
+      pat_p="$(cd "$pat" 2>/dev/null && pwd -P)"
+      if [[ -n "$pat_p" && ( "$phys" == "$pat_p"/* || "$main" == "$pat_p"/* ) ]]; then prof="$p"; break; fi
+    fi
+  done <"$map"
+fi
+
+if [[ -n "${RIGOR_IDENTITY_RESOLVE:-}" ]]; then
+  if [[ -n "${AWS_PROFILE:-}${AWS_ACCESS_KEY_ID:-}" ]]; then echo "env"
+  elif [[ -n "$prof" ]]; then echo "$prof"
+  fi
+  exit 0
+fi
+
+[[ -n "$prof" ]] && export AWS_PROFILE="$prof"
+exec "$real" "$@"
