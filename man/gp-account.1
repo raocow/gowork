@@ -18,7 +18,11 @@ gp-account \- tie directories to different git/ssh/GitHub identities
 .B gp account key
 .I NAME
 .br
+.B gp account register
+.I NAME
+.br
 .B gp account check
+.RB [ \-\-fix ]
 .SH DESCRIPTION
 Work split across more than one GitHub account \(em a personal one and an
 employer's \(em normally means remembering to set
@@ -48,6 +52,34 @@ current directory and scopes its
 .B gh
 calls to that identity, so the right account is used no matter which shell,
 script or agent invoked it.
+.PP
+.B register
+gets the account's key accepted by GitHub and then routes the account's bound
+repositories over ssh. It asks GitHub over ssh whose key it is; if the key is
+refused, it uploads it with the account's own
+.B gh
+token. The first time, that token needs the
+.I write:public_key
+scope: a browser window opens with the one-time code on your clipboard, and
+you approve it there. Because
+.B gh
+can only refresh its active account, this is the one place gitplus switches
+that machine-wide setting, for the length of the approval, and it always
+switches back. Once the key is verified, the account's identity file gains
+.I url.<alias>.insteadOf
+rules, so repositories under its bound directories push and pull through
+.I git@<host>\-<name>
+even when their remotes are https \(em no remote is edited. Routing is never
+turned on for a key GitHub refuses, so it can't break pushes that work.
+.PP
+.B check
+also asks GitHub whether each key is still accepted \(em an organization can
+expire or revoke one, and every git operation in its repositories then fails
+with "Permission denied (publickey)".
+.B \-\-fix
+runs
+.B register
+for refused keys and turns routing on for accepted ones.
 .SH OPTIONS
 .TP
 .BI \-\-email " EMAIL"

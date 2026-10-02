@@ -284,6 +284,257 @@ before="$(cat "$LEGACY/.ssh/config")"
 lg add legacy --email legacy@old.com >/dev/null 2>&1
 check "re-add doesn't duplicate a legacy block" "$(cat "$LEGACY/.ssh/config")" "$before"
 
+echo "== register: get the key onto GitHub, then route over ssh =="
+# GitHub is faked at both ends: ssh answers from a state file, and gh records
+# what it was asked to do. An "accepted" file is what the fake ssh reports
+# success from; the fake key upload creates it, the way a real one would.
+ST="$TMP/ghstate"; mkdir -p "$ST"
+# Acceptance is per key (per ssh alias); a bare "accepted" file overrides
+# every alias, for the wrong-account case.
+cat > "$FAKEBIN/ssh" <<EOF
+#!/usr/bin/env bash
+host="\${@: -1}"; host="\${host#git@}"
+for f in "$ST/accepted-\$host" "$ST/accepted"; do
+  if [ -f "\$f" ]; then
+    echo "Hi \$(cat "\$f")! You've successfully authenticated, but GitHub does not provide shell access."
+    exit 1
+  fi
+done
+echo "git@github.com: Permission denied (publickey)."
+exit 255
+EOF
+cat > "$FAKEBIN/gh" <<EOF
+#!/usr/bin/env bash
+user=""; prev=""
+for a in "\$@"; do [ "\$prev" = --user ] && user="\$a"; prev="\$a"; done
+case "\$1 \$2" in
+  "auth token")  echo "tok-\$user"; exit 0 ;;
+  "auth status")
+    if [ "\$3" = --active ]; then echo "  - account \$(cat "$ST/active")"; exit 0; fi
+    echo "  ✓ Logged in to github.com account sshy-gh (keyring)"; exit 0 ;;
+  "auth switch") echo "switch \$user" >> "$ST/log"; echo "\$user" > "$ST/active"; exit 0 ;;
+  "auth refresh")
+    echo "refresh as \$(cat "$ST/active")" >> "$ST/log"
+    [ -f "$ST/refresh-fail" ] && exit 1
+    echo "repo, write:public_key" > "$ST/scopes"; exit 0 ;;
+  "api -i")      echo "X-Oauth-Scopes: \$(cat "$ST/scopes" 2>/dev/null)"; echo; echo '{}'; exit 0 ;;
+  "api -X")
+    if [ -f "$ST/post-fail" ]; then cat "$ST/post-fail" >&2; exit 1; fi
+    # The uploaded key becomes accepted for the account whose token sent it
+    # (test accounts are named <acct> with gh user <acct>-gh).
+    u="\${GH_TOKEN#tok-}"
+    echo "post \$GH_TOKEN" >> "$ST/log"; echo "\$u" > "$ST/accepted-github.com-\${u%-gh}"; exit 0 ;;
+esac
+exit 1
+EOF
+chmod +x "$FAKEBIN/ssh" "$FAKEBIN/gh"
+export GITPLUS_SSH="$FAKEBIN/ssh"
+reset_gh() { rm -f "$ST"/*; echo other-gh > "$ST/active"; }
+pg() { PATH="$FAKEBIN:$PATH" "$ACCT" "$@"; }
+
+mkdir -p "$TMP/code/sshy"
+"$ACCT" add sshy --email s@sshy.com --gh-user sshy-gh --dir "$TMP/code/sshy" >/dev/null 2>&1
+git init -q "$TMP/code/sshy/repo"
+git -C "$TMP/code/sshy/repo" remote add origin https://github.com/acme/widget.git
+check "add with no terminal doesn't route yet" \
+  "$(git -C "$TMP/code/sshy/repo" remote get-url origin)" "https://github.com/acme/widget.git"
+
+# Refused, token can't add keys, no terminal: say what to run, change nothing.
+reset_gh; echo "repo" > "$ST/scopes"
+out="$(pg register sshy 2>&1)"; rc=$?
+check "refused + no scope + no tty fails" "$rc" "1"
+saw "says to run it in a terminal" "$out" "Run in a terminal: gp account register sshy"
+check "no switch, refresh or upload without a terminal" "$(cat "$ST/log" 2>/dev/null)" ""
+check "remote not rewritten while the key is refused" \
+  "$(git -C "$TMP/code/sshy/repo" remote get-url origin)" "https://github.com/acme/widget.git"
+
+# check reports the refused key and fails.
+out="$(pg check 2>&1)"; rc=$?
+saw "check reports a refused key" "$out" "ssh key  : NOT ACCEPTED by GitHub (fix: gp account check --fix)"
+check "check fails on a refused key" "$rc" "1"
+
+# Refused, token already has the scope: upload with THAT account's token, verify, route.
+reset_gh; echo "repo, write:public_key" > "$ST/scopes"
+out="$(pg register sshy 2>&1)"; rc=$?
+check "register with scope succeeds" "$rc" "0"
+saw "uploads with the account's own token" "$(cat "$ST/log")" "post tok-sshy-gh"
+saw "verifies after upload" "$out" "verified — GitHub accepts it as sshy-gh"
+check "https remote now goes over the alias" \
+  "$(git -C "$TMP/code/sshy/repo" remote get-url origin)" "git@github.com-sshy:acme/widget.git"
+git -C "$TMP/code/sshy/repo" remote set-url origin git@github.com:acme/widget.git
+check "scp-style github.com remote goes over the alias too" \
+  "$(git -C "$TMP/code/sshy/repo" remote get-url origin)" "git@github.com-sshy:acme/widget.git"
+check "rewrite only applies inside bound dirs" \
+  "$(git -C "$TMP/code/probe" remote get-url origin)" "https://github.com/acme/widget.git"
+check "never switched gh's global account" "$(grep -c switch "$ST/log")" "0"
+
+# Re-running on a working key only verifies — no second upload, no duplicate rewrite.
+before="$(cat "$TMP/.gitconfig-sshy")"
+out="$(pg register sshy 2>&1)"
+saw "re-register just verifies" "$out" "ssh key  : ok"
+check "no second upload" "$(grep -c post "$ST/log")" "1"
+check "rewrite not duplicated" "$(cat "$TMP/.gitconfig-sshy")" "$before"
+out="$(pg check 2>&1)"
+saw "check shows routing on" "$out" "routing  : https -> ssh"
+
+# Key accepted as somebody else: refuse to route.
+reset_gh; echo someone-else > "$ST/accepted"
+out="$(pg register sshy 2>&1)"; rc=$?
+check "wrong account fails" "$rc" "1"
+saw "wrong account named" "$out" "accepts it as 'someone-else', not 'sshy-gh'"
+
+# GitHub refuses the upload (key already on another account).
+reset_gh; echo "repo, write:public_key" > "$ST/scopes"
+echo '{"message":"key is already in use"}' > "$ST/post-fail"
+out="$(pg register sshy 2>&1)"; rc=$?
+check "upload refusal fails" "$rc" "1"
+saw "explains key already in use" "$out" "GitHub has this key on a different account already"
+
+echo "== register: the one-time browser approval =="
+# Needs a terminal; script(1) provides one. gh can only refresh the ACTIVE
+# account, so register switches to it and must always switch back.
+if script -q /dev/null true </dev/null >/dev/null 2>&1; then
+  inpty() { script -q /dev/null env PATH="$FAKEBIN:$PATH" "$@" </dev/null; }
+  reset_gh; echo "repo" > "$ST/scopes"
+  out="$(inpty "$ACCT" register sshy 2>&1)"
+  check "switch -> refresh as the account -> switch back -> upload" \
+    "$(tr '\n' '|' < "$ST/log")" "switch sshy-gh|refresh as sshy-gh|switch other-gh|post tok-sshy-gh|"
+  check "active account restored" "$(cat "$ST/active")" "other-gh"
+  saw "tells the user what the browser is for" "$out" "A browser window will open"
+
+  reset_gh; echo "repo" > "$ST/scopes"; touch "$ST/refresh-fail"
+  out="$(inpty "$ACCT" register sshy 2>&1)"
+  check "failed approval still switches back, uploads nothing" \
+    "$(tr '\n' '|' < "$ST/log")" "switch sshy-gh|refresh as sshy-gh|switch other-gh|"
+  check "active account restored after failure" "$(cat "$ST/active")" "other-gh"
+
+  # Through check --fix too: its loops read from stdin, which must not hide
+  # the terminal from register.
+  reset_gh; echo "repo" > "$ST/scopes"
+  inpty "$ACCT" check --fix >/dev/null 2>&1
+  # The fake's scopes are shared, so only the first account (work) needs the
+  # approval; what matters is that it got one, and switched back.
+  saw "check --fix gets the browser approval to the terminal" \
+    "$(tr '\n' '|' < "$ST/log" 2>/dev/null)" "switch work-gh|refresh as work-gh|switch other-gh|post tok-work-gh|"
+
+  reset_gh; echo "repo" > "$ST/scopes"; echo sshy-gh > "$ST/active"
+  inpty "$ACCT" register sshy >/dev/null 2>&1
+  check "already-active account: no switching at all" \
+    "$(tr '\n' '|' < "$ST/log")" "refresh as sshy-gh|post tok-sshy-gh|"
+else
+  echo "  skip (no script(1) pty available)"
+fi
+unset GITPLUS_SSH
+
+echo "== worktrees resolve through their main repository =="
+# A linked worktree can live outside every bound directory; gh must follow the
+# repo it belongs to, the way git's includeIf already does.
+git -C "$TMP/code/sshy/repo" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+mkdir -p "$TMP/elsewhere"
+git -C "$TMP/code/sshy/repo" worktree add -q "$TMP/elsewhere/wt" 2>/dev/null
+check "worktree outside the bound dir gets the repo's gh user" \
+  "$("$ACCT" _gh-for-dir "$TMP/elsewhere/wt")" "sshy-gh"
+check "git agrees (identity via includeIf)" \
+  "$(git -C "$TMP/elsewhere/wt" config user.email)" "s@sshy.com"
+check "a plain dir outside every binding still resolves to nothing" \
+  "$("$ACCT" _gh-for-dir "$TMP/elsewhere")" ""
+
+echo "== unbind =="
+"$ACCT" bind sshy "$TMP/code/keep" >/dev/null 2>&1
+"$ACCT" bind sshy "$TMP/code/drop" >/dev/null 2>&1
+"$ACCT" bind sshy "$TMP/code/ghost1" >/dev/null 2>&1
+"$ACCT" bind work "$TMP/code/ghost2" >/dev/null 2>&1
+mkdir -p "$TMP/code/keep" "$TMP/code/drop"
+blanks_before="$(grep -c '^$' "$GITPLUS_GITCONFIG")"
+
+out="$("$ACCT" unbind sshy "$TMP/code/drop" 2>&1)"
+saw "unbind reports it" "$out" "unbound:"
+binds="$("$ACCT" list)"
+case "$binds" in *"$TMP/code/drop"*) bad "binding removed" ;; *) ok "binding removed" ;; esac
+saw "neighbouring binding kept" "$binds" "$TMP/code/keep"
+check "git config still parses" "$(git config --file "$GITPLUS_GITCONFIG" --list >/dev/null 2>&1 && echo yes)" "yes"
+check "its blank separator went with it" "$(grep -c '^$' "$GITPLUS_GITCONFIG")" "$((blanks_before - 1))"
+[ -f "$GITPLUS_GITCONFIG.gitplus-bak" ] && ok "backup kept" || bad "backup kept"
+
+out="$("$ACCT" unbind sshy "$TMP/code/never-bound" 2>&1)"; rc=$?
+check "unbinding something not bound fails" "$rc" "1"
+
+out="$("$ACCT" unbind --missing 2>&1)"
+saw "--missing drops a missing dir" "$out" "/code/ghost1 (was sshy)"
+saw "--missing covers every account" "$out" "/code/ghost2 (was work)"
+binds="$("$ACCT" list)"
+case "$binds" in *ghost*) bad "no missing bindings left" ;; *) ok "no missing bindings left" ;; esac
+saw "existing dirs survive --missing" "$binds" "$TMP/code/keep"
+saw "second --missing is a no-op" "$("$ACCT" unbind --missing 2>&1)" "no bindings point at missing directories"
+check_bound() { "$ACCT" list | grep -qF "    $(echo "$1" | sed "s|^$HOME|~|")"; }
+
+echo "== sweep: trace dead bindings before touching them =="
+export GITPLUS_SEARCH_ROOTS="$TMP/code"
+"$ACCT" unbind --missing >/dev/null 2>&1   # start from no dead bindings
+
+# a) moved, new place unbound -> rebind (traced by the origin bind recorded)
+mkdir -p "$TMP/code/old/proj"; git init -q "$TMP/code/old/proj"
+git -C "$TMP/code/old/proj" remote add origin https://github.com/acme/moved.git
+"$ACCT" bind sshy "$TMP/code/old/proj" >/dev/null 2>&1
+has "bind records the origin" "# gitplus:origin acme/moved" "$GITPLUS_GITCONFIG"
+mkdir -p "$TMP/code/new"; mv "$TMP/code/old/proj" "$TMP/code/new/renamed"
+# b) gone, but a repo by that name is bound to the same account -> drop
+"$ACCT" bind sshy "$TMP/code/wt-gone/repo" >/dev/null 2>&1
+# c) gone, its repo is bound to a different account -> keep, ask
+mkdir -p "$TMP/code/workside/thing"; git init -q "$TMP/code/workside/thing"
+"$ACCT" bind work "$TMP/code/workside/thing" >/dev/null 2>&1
+"$ACCT" bind sshy "$TMP/gone/thing" >/dev/null 2>&1
+# d) no trace at all -> drop
+"$ACCT" bind sshy "$TMP/code/nothing-like-this" >/dev/null 2>&1
+
+before="$(cat "$GITPLUS_GITCONFIG")"
+out="$("$ACCT" sweep 2>&1)"
+saw "moved repo found by origin"       "$out" "a repo matching by origin acme/moved is at"
+saw "moved repo planned for rebind"    "$out" "plan: rebind it there"
+saw "worktree-style repo already bound" "$out" "already bound to sshy"
+saw "other account's repo is a question" "$out" "bound to work, not sshy"
+saw "no trace -> drop"                 "$out" "no repo matching by name 'nothing-like-this' was found"
+saw "no terminal: says how to apply"   "$out" "gp account sweep --yes"
+check "no terminal: nothing changed"   "$(cat "$GITPLUS_GITCONFIG")" "$before"
+
+if command -v expect >/dev/null 2>&1; then
+  # Interactive, answering each prompt as it appears (piping answers in
+  # ahead of the prompts through script(1) misaligns them).
+  sweep_answer() {  # sweep_answer <moved-answer> <conflict-answer> <apply-answer>
+    expect -c "
+      set timeout 10
+      spawn $ACCT sweep
+      expect {(r) } { send \"$1\r\" }
+      expect {? (k) } { send \"$2\r\" }
+      expect {\[Y/n\] } { send \"$3\r\" }
+      expect eof
+    " >/dev/null 2>&1
+  }
+  sweep_answer d k n
+  check "declining at the end changes nothing" "$(cat "$GITPLUS_GITCONFIG")" "$before"
+  sweep_answer d k y
+  binds="$("$ACCT" list)"
+  case "$binds" in *"/code/new/renamed"*) bad "answering d drops instead of rebinding" ;; *) ok "answering d drops instead of rebinding" ;; esac
+  case "$binds" in *"/code/old/proj"*) bad "old moved binding removed" ;; *) ok "old moved binding removed" ;; esac
+  saw "answering k keeps the other account's question" "$binds" "/gone/thing"
+  cp "$GITPLUS_GITCONFIG.gitplus-bak" "$GITPLUS_GITCONFIG"   # back to the scenario for --yes
+else
+  echo "  skip interactive sweep (no expect)"
+fi
+
+out="$("$ACCT" sweep --yes 2>&1)"
+binds="$("$ACCT" list)"
+saw "--yes rebinds the moved repo"      "$binds" "/code/new/renamed"
+case "$binds" in *"/code/old/proj"*)   bad "--yes drops the old moved path" ;; *) ok "--yes drops the old moved path" ;; esac
+case "$binds" in *"/wt-gone/repo"*)     bad "--yes drops the covered one" ;; *) ok "--yes drops the covered one" ;; esac
+case "$binds" in *"nothing-like-this"*) bad "--yes drops the untraceable one" ;; *) ok "--yes drops the untraceable one" ;; esac
+saw "--yes keeps the conflict for you"  "$binds" "/gone/thing"
+check "git config still parses" "$(git config --file "$GITPLUS_GITCONFIG" --list >/dev/null 2>&1 && echo yes)" "yes"
+saw "check points broken bindings at sweep" "$("$ACCT" check 2>&1)" "sweep dead ones with: gp account sweep"
+unset GITPLUS_SEARCH_ROOTS
+check "identity still applies after unbinding" \
+  "$(git -C "$TMP/code/sshy/repo" config user.email)" "s@sshy.com"
+
 echo ""
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
