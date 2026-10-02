@@ -64,9 +64,12 @@ version() {
   if [ -d "$ROOT/.git" ]; then
     echo "gowork $(git -C "$ROOT" describe --tags --always 2>/dev/null || echo dev)"
   else
-    local v
-    v="$(brew info --json=v2 gowork 2>/dev/null | sed -n 's/.*"installed":\[{"version":"\([^"]*\)".*/\1/p')"
-    echo "gowork ${v:-unknown}"
+    # A Homebrew keg is .../Cellar/gowork/<version>: read it from there,
+    # offline, rather than asking brew (which may want the network).
+    case "$(cd -P "$ROOT" && pwd)" in
+      */Cellar/gowork/*) echo "gowork $(basename "$(cd -P "$ROOT" && pwd)")" ;;
+      *)                 echo "gowork unknown" ;;
+    esac
   fi
 }
 

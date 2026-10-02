@@ -22,6 +22,8 @@ saw()  { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1" ;; esac; }
 # Resolve physically: on macOS mktemp hands back a /var path that is really
 # /private/var, and git matches includeIf against real paths (see _acct_abspath).
 TMP="$(cd "$(mktemp -d)" && pwd -P)"
+# Never run against an empty path: every file below is written under it.
+[ -n "$TMP" ] && [ -d "$TMP" ] && [ "$TMP" != / ] || { echo "no temp dir; aborting" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 export HOME="$TMP"
 export GITPLUS_SSH_CONFIG="$TMP/.ssh/config"

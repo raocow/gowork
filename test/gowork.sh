@@ -13,6 +13,8 @@ saw()  { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1" ;; esac; }
 nosaw(){ case "$2" in *"$3"*) bad "$1" ;; *) ok "$1" ;; esac; }
 
 TMP="$(cd "$(mktemp -d)" && pwd -P)"
+# Never run against an empty path: every file below is written under it.
+[ -n "$TMP" ] && [ -d "$TMP" ] && [ "$TMP" != / ] || { echo "no temp dir; aborting" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 export HOME="$TMP" GIT_CONFIG_GLOBAL="$TMP/.gitconfig" GIT_CONFIG_NOSYSTEM=1
 export RIGOR_RC="$TMP/.zshrc"

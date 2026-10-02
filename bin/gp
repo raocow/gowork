@@ -55,8 +55,10 @@ case "$cmd" in
     if [ -f "$BIN_DIR/../.git/HEAD" ]; then
       echo "gp $(git -C "$BIN_DIR/.." describe --tags --always 2>/dev/null || echo dev)"
     else
-      v="$(brew info --json=v2 gitplus 2>/dev/null | sed -n 's/.*"installed":\[{"version":"\([^"]*\)".*/\1/p')"
-      echo "gp ${v:-unknown}"
+      case "$(cd -P "$BIN_DIR/.." && pwd)" in
+        */Cellar/*/*) echo "gp $(basename "$(cd -P "$BIN_DIR/.." && pwd)")" ;;
+        *)            echo "gp unknown" ;;
+      esac
     fi ;;
   *)
     if [ -x "$BIN_DIR/gp-$cmd" ]; then
