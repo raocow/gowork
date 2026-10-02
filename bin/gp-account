@@ -42,6 +42,9 @@ while [ -h "$_src" ]; do
   [[ "$_src" != /* ]] && _src="$_dir/$_src"
 done
 source "$(cd -P "$(dirname "$_src")/.." && pwd)/lib/gitplus-common.sh"
+# gw browser's helper, for opening GitHub pages in the profile signed in to
+# the account at hand (absent outside a gowork install).
+BROWSER_HELPER="$(cd -P "$(dirname "$_src")/.." && pwd)/libexec/gowork-browser"
 
 usage() {
   cat <<'EOF'
@@ -460,7 +463,9 @@ _acct_await_sso() {
   fi
   echo "           Opening $url. Next to \"gitplus $name …\", click Configure SSO,"
   echo "           then Authorize next to $owner. Waiting for it (Ctrl-C to stop)…"
-  ${GITPLUS_OPEN:-open} "$url" >/dev/null 2>&1 || true
+  if [ -n "${GITPLUS_OPEN:-}" ]; then "$GITPLUS_OPEN" "$url" >/dev/null 2>&1 || true
+  elif [ -x "$BROWSER_HELPER" ]; then "$BROWSER_HELPER" open "$name" "$url" >/dev/null 2>&1 || true
+  else open "$url" >/dev/null 2>&1 || true; fi
   local i rc
   for i in $(seq 1 "${GITPLUS_SSO_TRIES:-120}"); do
     sleep "${GITPLUS_SSO_POLL:-5}"
@@ -506,7 +511,7 @@ _acct_active_gh() {
 # machine-wide account — for the length of the approval, switched back after,
 # including on Ctrl-C.
 _acct_grant_key_scope() {
-  local ghuser="$1" prev rc=0
+  local ghuser="$1" acct="${2:-$1}" prev rc=0
   prev="$(_acct_active_gh)"
   if [ "$prev" != "$ghuser" ]; then
     env -u GH_TOKEN -u GITHUB_TOKEN gh auth switch --hostname github.com --user "$ghuser" >/dev/null 2>&1 \
@@ -517,7 +522,11 @@ _acct_grant_key_scope() {
   echo "A browser window will open. Sign in as $ghuser if asked, paste the code"
   echo "(already on your clipboard) and approve. This is needed once per account."
   echo ""
-  env -u GH_TOKEN -u GITHUB_TOKEN gh auth refresh --hostname github.com \
+  # gh opens the device page itself; GH_BROWSER sends it to the profile signed
+  # in to this account (gw browser), falling back to the default browser.
+  local gb=()
+  [ -x "$BROWSER_HELPER" ] && gb=("GH_BROWSER=$BROWSER_HELPER open $acct")
+  env -u GH_TOKEN -u GITHUB_TOKEN ${gb[@]+"${gb[@]}"} gh auth refresh --hostname github.com \
     --scopes write:public_key --clipboard || rc=$?
   if [ -n "$prev" ] && [ "$prev" != "$ghuser" ]; then
     env -u GH_TOKEN -u GITHUB_TOKEN gh auth switch --hostname github.com --user "$prev" >/dev/null 2>&1
@@ -573,7 +582,7 @@ acct_register() {
         echo "           approval. Run in a terminal: gw account register $name" >&2
         return 1
       fi
-      _acct_grant_key_scope "$ghuser" || { echo "gw account: approval didn't complete" >&2; return 1; }
+      _acct_grant_key_scope "$ghuser" "$name" || { echo "gw account: approval didn't complete" >&2; return 1; }
       tok="$(env -u GH_TOKEN -u GITHUB_TOKEN gh auth token --hostname github.com --user "$ghuser" 2>/dev/null)"
       ;;
   esac

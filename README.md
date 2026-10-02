@@ -48,6 +48,7 @@ names for that reason.
 | `gw shell enable\|disable\|status\|doctor\|init` | autovenv, pyf, envup | `rigor enable` … |
 | `gw notify setup\|status\|test\|off` | phone notifications for agent turns | `rigor push …` |
 | `gw sleep on\|off\|status` | keep the Mac awake | `rigor sleep …` |
+| `gw browser setup\|sync\|status\|off` | open GitHub links in the Chrome profile signed in to the right account | — |
 | `gw migrate` | move a rigor/gitplus setup over | — |
 
 The git commands are documented in depth in [docs/gp.md](docs/gp.md), and the
@@ -88,6 +89,15 @@ the bound account's token to the real gh for that one call. `setup` also:
 
 `gw account sweep` deals with bindings whose directory is gone. It traces
 where each repo went and drops the binding, rebinds it, or asks you.
+
+`gw browser setup` does the same for links you click. A link opened from a
+terminal goes to macOS's default browser, in whichever profile was used last.
+gowork installs [Finicky](https://github.com/johnste/finicky) (MIT), a small
+browser router, asks which Chrome profile each account is signed into, and
+writes its rules from your accounts: each account's login, its GitHub orgs,
+and the owners of its bound repos. Run `gw browser sync` after binding new
+repos. gowork's own browser steps (device approval, SSO authorization) open
+straight in the account's profile.
 
 An explicit `GH_TOKEN`, `AWS_PROFILE` or `AWS_ACCESS_KEY_ID` always wins.
 `RIGOR_IDENTITY_OFF=1` turns both shims into passthroughs for one command.

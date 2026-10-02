@@ -51,6 +51,7 @@ Shell and machine:
   shell status|doctor|init
   notify setup|status|test|off    phone notifications when agent turns end
   sleep on|off|status             keep the Mac awake (sudo pmset)
+  browser setup|sync|status|off   open GitHub links in the right account's Chrome profile
 
   migrate     move an existing rigor/gitplus setup over to gowork
   version     print the version
@@ -110,6 +111,7 @@ case "$cmd" in
   notify)  exec "$BIN_DIR/rigor" push "$@" ;;
   sleep)   exec "$BIN_DIR/rigor" sleep "$@" ;;
   migrate) exec "$ROOT/libexec/gowork-migrate" "$@" ;;
+  browser) exec "$ROOT/libexec/gowork-browser" "$@" ;;
 
   *)
     if git help "$cmd" >/dev/null 2>&1; then

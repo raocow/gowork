@@ -28,6 +28,7 @@ case $state in
       'shell:shell features (autovenv, pyf, envup)'
       'notify:phone notifications for agent turns'
       'sleep:keep the Mac awake'
+      'browser:open GitHub links in the right Chrome profile'
       'migrate:move a rigor/gitplus setup to gowork'
       'help:show help'
       'version:print version'
@@ -73,6 +74,8 @@ case $state in
         fi ;;
       notify)
         (( CURRENT == 2 )) && { local -a subs=(setup status test off); _describe 'notify command' subs; } ;;
+      browser)
+        (( CURRENT == 2 )) && { local -a subs=(setup sync status off open); _describe 'browser command' subs; } ;;
       sleep)
         (( CURRENT == 2 )) && { local -a subs=(on off status); _describe 'sleep command' subs; } ;;
       *)
