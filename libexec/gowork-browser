@@ -228,7 +228,15 @@ export default {
   ],
 };
 EOF
-  mv "$tmp" "$FINICKY_CONF"
+  # In place, not mv: Finicky watches the file it loaded, and a rename swaps a
+  # new file in under it, so every later change goes unnoticed (its cached
+  # config stayed a day old). Skipped when nothing changed.
+  if [ -f "$FINICKY_CONF" ] && cmp -s "$tmp" "$FINICKY_CONF"; then
+    rm -f "$tmp"
+  else
+    cat "$tmp" > "$FINICKY_CONF"
+    rm -f "$tmp"
+  fi
   echo "wrote ${FINICKY_CONF/#$HOME/~} ($(printf '%s' "$rules" | grep -c . || true) GitHub owner(s), $(printf '%s' "$urlrules" | grep -c . || true) URL rule(s), $(printf '%s' "$apprules" | grep -c . || true) app rule(s))"
 }
 
