@@ -86,10 +86,13 @@ if command -v node >/dev/null 2>&1; then
   # The routing itself, run the way Finicky would.
   cat > "$TMP/route.mjs" <<EOF
 import cfg from "$TMP/check.mjs";
-const h = cfg.handlers[0];
+const route = (u) => {
+  const url = new URL(u), opts = { opener: null };
+  for (const h of cfg.handlers) if (h.match(url, opts)) { const b = h.browser(url, opts); return [b.name, b.profile].filter(Boolean).join("/"); }
+  return "default";
+};
 for (const u of ["https://github.com/ClientOrg/app/pull/3", "https://github.com/me-gh/tool", "https://github.com/other/x", "https://example.com/"]) {
-  const url = new URL(u);
-  console.log(u, h.match(url) ? [h.browser(url).name, h.browser(url).profile].filter(Boolean).join("/") : "default");
+  console.log(u, route(u));
 }
 EOF
   r="$(node "$TMP/route.mjs" 2>&1)"
@@ -100,6 +103,62 @@ EOF
 else
   echo "  skip JS checks (no node)"
 fi
+
+echo "== your own rules =="
+"$GW" browser add work '*.sharepoint.com' >/dev/null 2>&1
+"$GW" browser add work 'https://jira.example.com/browse/ABC-1?x=1#y' >/dev/null 2>&1
+"$GW" browser add me 'jira.example.com/browse/ME' >/dev/null 2>&1
+"$GW" browser add work --app Slack >/dev/null 2>&1
+out="$("$GW" browser add nobody example.org 2>&1)"; rc=$?
+check "rule for an unmapped account is refused" "$rc" "1"
+r="$("$GW" browser rules)"
+saw "domain rule listed"                 "$r" "*.sharepoint.com"
+saw "pasted URL kept as host + path"     "$r" "jira.example.com/browse/ABC-1"
+nosaw "query and fragment dropped"       "$r" "?x=1"
+saw "app rule listed"                    "$r" "clicked in Slack"
+saw "rules show up in the config"        "$(cat "$TMP/.finicky.js")" '{ host: "*.sharepoint.com", path: "", browser: { name: "Island" } }'
+if command -v node >/dev/null 2>&1; then
+  cp "$TMP/.finicky.js" "$TMP/check2.mjs"
+  node --check "$TMP/check2.mjs" 2>/dev/null && ok "config with rules is valid JavaScript" || bad "config with rules is valid JavaScript"
+  # Run every handler in order, the way Finicky does, with an opener.
+  cat > "$TMP/route2.mjs" <<EOF
+import cfg from "$TMP/check2.mjs";
+const route = (u, app) => {
+  const url = new URL(u), opts = { opener: app ? { name: app, bundleId: "x." + app } : null };
+  for (const h of cfg.handlers) if (h.match(url, opts)) { const b = h.browser(url, opts); return [b.name, b.profile].filter(Boolean).join("/"); }
+  return "default";
+};
+for (const [u, app] of [
+  ["https://client.sharepoint.com/sites/x", null],
+  ["https://sharepoint.com/", null],
+  ["https://notsharepoint.com/", null],
+  ["https://jira.example.com/browse/ABC-1", null],
+  ["https://jira.example.com/browse/ME-2", null],
+  ["https://jira.example.com/other", null],
+  ["https://news.example.net/", "Slack"],
+  ["https://github.com/me-gh/tool", "Slack"],
+  ["https://news.example.net/", "Mail"],
+]) console.log(u, app || "-", route(u, app));
+EOF
+  r="$(node "$TMP/route2.mjs" 2>&1)"
+  saw "subdomain matches *.domain"         "$r" "client.sharepoint.com/sites/x - Island"
+  saw "bare domain matches *.domain too"   "$r" "https://sharepoint.com/ - Island"
+  saw "lookalike domain doesn't"           "$r" "https://notsharepoint.com/ - default"
+  saw "path prefix rule"                   "$r" "browse/ABC-1 - Island"
+  saw "different path, different account" "$r" "browse/ME-2 - Google Chrome/Personal"
+  saw "host without a matching path falls through" "$r" "jira.example.com/other - default"
+  saw "app rule: clicked in Slack"         "$r" "news.example.net/ Slack Island"
+  saw "GitHub owner beats the app rule"    "$r" "me-gh/tool Slack Google Chrome/Personal"
+  saw "other apps fall through"            "$r" "news.example.net/ Mail default"
+fi
+"$GW" browser remove '*.sharepoint.com' >/dev/null 2>&1
+"$GW" browser remove --app Slack >/dev/null 2>&1
+r="$("$GW" browser rules)"
+nosaw "removed domain rule" "$r" "sharepoint"
+nosaw "removed app rule" "$r" "Slack"
+nosaw "removed from the config" "$(cat "$TMP/.finicky.js")" "sharepoint"
+out="$("$GW" browser remove nothing.example 2>&1)"; rc=$?
+check "removing a missing rule fails" "$rc" "1"
 
 echo "== open / status / off =="
 rm -f "$TMP/opened"

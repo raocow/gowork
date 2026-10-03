@@ -51,7 +51,8 @@ Shell and machine:
   shell status|doctor|init
   notify setup|status|test|off    phone notifications when agent turns end
   sleep on|off|status             keep the Mac awake (sudo pmset)
-  browser setup|sync|status|off   open GitHub links in the right account's Chrome profile
+  browser setup|sync|status|off   open links in the browser signed in to the right account
+  browser add|remove|rules        your own rules: domains, or links from an app
 
   migrate     move an existing rigor/gitplus setup over to gowork
   version     print the version

@@ -99,6 +99,19 @@ and the owners of its bound repos. Run `gw browser sync` after binding new
 repos. gowork's own browser steps (device approval, SSO authorization) open
 straight in the account's profile.
 
+Links that aren't GitHub repos follow your own rules, each sent to an
+account's browser:
+
+```bash
+gw browser add work '*.sharepoint.com'          # a domain and its subdomains
+gw browser add work jira.example.com/browse     # a host with a path prefix
+gw browser add work --app Slack                 # anything clicked in that app
+gw browser rules                                # list; gw browser remove … to drop
+```
+
+The first match wins, in this order: your URL rules, GitHub owners, your app
+rules, then the default.
+
 An explicit `GH_TOKEN`, `AWS_PROFILE` or `AWS_ACCESS_KEY_ID` always wins.
 `RIGOR_IDENTITY_OFF=1` turns both shims into passthroughs for one command.
 

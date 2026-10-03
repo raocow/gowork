@@ -75,7 +75,7 @@ case $state in
       notify)
         (( CURRENT == 2 )) && { local -a subs=(setup status test off); _describe 'notify command' subs; } ;;
       browser)
-        (( CURRENT == 2 )) && { local -a subs=(setup sync status off open); _describe 'browser command' subs; } ;;
+        (( CURRENT == 2 )) && { local -a subs=(setup sync status off rules add remove open); _describe 'browser command' subs; } ;;
       sleep)
         (( CURRENT == 2 )) && { local -a subs=(on off status); _describe 'sleep command' subs; } ;;
       *)

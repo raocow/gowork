@@ -7,6 +7,10 @@
 #   gw browser status         what's set up
 #   gw browser off            remove the rules, restoring any ~/.finicky.js from before
 #   gw browser open <account> <url>    open <url> in <account>'s profile
+#   gw browser add <account> <host[/path]>   your own rule: that host to that account
+#   gw browser add <account> --app <name>    links clicked in that app to that account
+#   gw browser remove <host[/path]> | --app <name>
+#   gw browser rules          list your own rules
 #
 # A link clicked in a terminal goes to macOS's default browser, in whichever
 # profile was used last — so a client org's repo opens signed in as the wrong
@@ -26,6 +30,10 @@ ROOT="$(cd -P "$(dirname "$_src")/.." && pwd)"
 ACCT="$ROOT/bin/gp-account"
 
 MAP="${GOWORK_BROWSER_MAP:-$HOME/.config/rigor/browser}"
+# Your own rules, "<account>\t<url|app>\t<pattern>" per line: a host (glob
+# "*.example.com" also matching example.com) with an optional path prefix, or
+# the name or bundle id of the app a link was clicked in.
+RULES="${GOWORK_BROWSER_RULES:-$HOME/.config/rigor/browser-rules}"
 FINICKY_CONF="${GOWORK_FINICKY_CONF:-$HOME/.finicky.js}"
 LOCAL_STATE="${GOWORK_CHROME_STATE:-$HOME/Library/Application Support/Google/Chrome/Local State}"
 FINICKY_APP="${GOWORK_FINICKY_APP:-/Applications/Finicky.app}"
@@ -145,6 +153,26 @@ sync() {
     done < <(owners_of "$a")
   done < <(map_rows)
 
+  # Your own rules, resolved to the browser of the account they name.
+  local kind pat urlrules="" apprules="" host path
+  if [ -f "$RULES" ]; then
+    while IFS=$'\t' read -r a kind pat; do
+      [ -n "$a" ] || continue
+      if ! m="$(map_get "$a" 2>/dev/null)"; then
+        echo "note: skipping rule for '$a' ($pat): no browser chosen for it — gw browser setup" >&2; continue
+      fi
+      IFS=$'\t' read -r b dir prof <<< "$m"
+      if [ "$kind" = app ]; then
+        apprules="$apprules    { app: $(js_str "$(printf '%s' "$pat" | tr 'A-Z' 'a-z')"), browser: $(browser_js "$b" "$dir" "$prof") },
+"
+      else
+        host="${pat%%/*}"; path=""; [ "$host" != "$pat" ] && path="/${pat#*/}"
+        urlrules="$urlrules    { host: $(js_str "$(printf '%s' "$host" | tr 'A-Z' 'a-z')"), path: $(js_str "$path"), browser: $(browser_js "$b" "$dir" "$prof") },
+"
+      fi
+    done < "$RULES"
+  fi
+
   local tmp; tmp="$(mktemp "$FINICKY_CONF.gowork.XXXXXX")"
   cat > "$tmp" <<EOF
 $MARK
@@ -152,26 +180,56 @@ $MARK
 // gowork's account bindings. To change it: gw browser setup, or gw browser
 // sync after binding new repos.
 
-// GitHub owner (user or org, lowercased) -> where its pages open.
+// Checked in this order; the first that matches decides.
+// 1. Your URL rules (gw browser add <account> <host[/path]>).
+const urlRules = [
+${urlrules}];
+// 2. GitHub owner (user or org, lowercased) -> where its pages open.
 const owners = {
 ${rules}};
+// 3. Your app rules (gw browser add <account> --app <name>): the app the link
+//    was clicked in, by name or bundle id, lowercased.
+const appRules = [
+${apprules}];
+
+// "*.example.com" matches example.com and every subdomain of it.
+const hostMatch = (host, pat) =>
+  pat.startsWith("*.") ? host === pat.slice(2) || host.endsWith(pat.slice(1)) : host === pat;
+const hostOf = (url) => (url.hostname || url.host || "").toLowerCase();
+
+let picked;   // set by a match, returned by its browser
+const pick = (b) => { picked = b; return Boolean(b); };
 
 export default {
   defaultBrowser: ${defjs},
   handlers: [
     {
+      match: (url) => pick(urlRules.find((r) =>
+        hostMatch(hostOf(url), r.host) && url.pathname.startsWith(r.path || "/"))?.browser),
+      browser: () => picked,
+    },
+    {
       match: (url) => {
-        if (url.host !== "github.com") return false;
+        if (hostOf(url) !== "github.com") return false;
         const owner = url.pathname.split("/")[1]?.toLowerCase();
-        return Boolean(owner && owners[owner]);
+        return pick(owner && owners[owner]);
       },
-      browser: (url) => owners[url.pathname.split("/")[1].toLowerCase()],
+      browser: () => picked,
+    },
+    {
+      match: (url, options) => {
+        const o = options && options.opener;
+        if (!o) return false;
+        const ids = [o.name, o.bundleId].filter(Boolean).map((s) => s.toLowerCase());
+        return pick(appRules.find((r) => ids.includes(r.app))?.browser);
+      },
+      browser: () => picked,
     },
   ],
 };
 EOF
   mv "$tmp" "$FINICKY_CONF"
-  echo "wrote ${FINICKY_CONF/#$HOME/~} ($(printf '%s' "$rules" | grep -c . || true) GitHub owner(s) routed)"
+  echo "wrote ${FINICKY_CONF/#$HOME/~} ($(printf '%s' "$rules" | grep -c . || true) GitHub owner(s), $(printf '%s' "$urlrules" | grep -c . || true) URL rule(s), $(printf '%s' "$apprules" | grep -c . || true) app rule(s))"
 }
 
 setup() {
@@ -239,6 +297,52 @@ off() {
   echo "  pick another in System Settings > Desktop & Dock > Default web browser"
 }
 
+# gw browser add <account> <host[/path]> | --app <name>
+add_rule() {
+  local a="${1:-}" kind=url pat="${2:-}"
+  if [ "$pat" = "--app" ]; then kind=app; pat="${3:-}"; fi
+  [ -n "$a" ] && [ -n "$pat" ] || die "usage: gw browser add <account> <host[/path]> | --app <name>"
+  map_get "$a" >/dev/null 2>&1 || die "no browser chosen for '$a' yet — gw browser setup"
+  if [ "$kind" = url ]; then
+    # Accept a pasted URL too: keep host and path, drop scheme, query, fragment.
+    pat="${pat#*://}"; pat="${pat%%[?#]*}"; pat="${pat%/}"
+    case "$pat" in *[[:space:]]*|"") die "not a host or URL: $pat" ;; esac
+  fi
+  mkdir -p "$(dirname "$RULES")"; touch "$RULES"
+  local tmp; tmp="$(mktemp "$RULES.XXXXXX")"
+  awk -F'\t' -v k="$kind" -v p="$pat" '!($2 == k && $3 == p)' "$RULES" > "$tmp"
+  printf '%s\t%s\t%s\n' "$a" "$kind" "$pat" >> "$tmp"
+  mv "$tmp" "$RULES"
+  if [ "$kind" = app ]; then echo "added: links clicked in $pat -> $a"; else echo "added: $pat -> $a"; fi
+  [ -f "$MAP" ] && sync
+}
+
+remove_rule() {
+  local kind=url pat="${1:-}"
+  if [ "$pat" = "--app" ]; then kind=app; pat="${2:-}"; fi
+  [ -n "$pat" ] || die "usage: gw browser remove <host[/path]> | --app <name>"
+  [ "$kind" = url ] && { pat="${pat#*://}"; pat="${pat%%[?#]*}"; pat="${pat%/}"; }
+  awk -F'\t' -v k="$kind" -v p="$pat" '$2 == k && $3 == p { f = 1 } END { exit !f }' "$RULES" 2>/dev/null \
+    || die "no such rule: $pat"
+  local tmp; tmp="$(mktemp "$RULES.XXXXXX")"
+  awk -F'\t' -v k="$kind" -v p="$pat" '!($2 == k && $3 == p)' "$RULES" > "$tmp"
+  mv "$tmp" "$RULES"
+  echo "removed: $pat"
+  [ -f "$MAP" ] && sync
+}
+
+list_rules() {
+  if [ ! -s "$RULES" ]; then
+    echo "no rules of your own; GitHub links are routed by account (gw browser status)"
+    return 0
+  fi
+  local a kind pat
+  while IFS=$'\t' read -r a kind pat; do
+    if [ "$kind" = app ]; then printf '  clicked in %-28s -> %s\n' "$pat" "$a"
+    else printf '  %-39s -> %s\n' "$pat" "$a"; fi
+  done < "$RULES"
+}
+
 # open <account> <url> — straight into the account's profile, no Finicky
 # needed. Falls back to the default browser when there's no mapping.
 open_as() {
@@ -258,5 +362,8 @@ case "${1:-}" in
   status) status ;;
   off)    off ;;
   open)   shift; open_as "$@" ;;
-  *) echo "usage: gw browser setup|sync|status|off|open <account> <url>" >&2; exit 2 ;;
+  add)    shift; add_rule "$@" ;;
+  remove|rm) shift; remove_rule "$@" ;;
+  rules)  list_rules ;;
+  *) echo "usage: gw browser setup|sync|status|off|rules|add|remove|open" >&2; exit 2 ;;
 esac
