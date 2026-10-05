@@ -12,11 +12,24 @@ The bookend to
 .BR gp-pr (1).
 After you have checked out a pull request's branch and finished reviewing it,
 .B gp done
-returns you to the base branch (origin's default, usually
-.IR main ),
-fast-forwards it to the latest on
+returns you to the base branch, fast-forwards it to the latest on
 .IR origin ,
 and deletes the branch you were on.
+.PP
+The base is where the branch's own pull request merged, or is headed if it is
+still open \(em in a repository that stages work on an integration branch,
+that is
+.IR next ,
+not
+.IR main ,
+and judging mergedness against
+.I main
+would refuse to delete a branch whose work landed exactly where it was meant
+to. A branch with no pull request (or no
+.BR gh ,
+or offline, or a pull request whose base has since been deleted) falls back to
+origin's default branch. The lookup is skipped on origin's default branch
+itself and on a detached HEAD.
 .PP
 The fast-forward is best effort: it uses
 .B git merge \-\-ff\-only
@@ -79,7 +92,7 @@ refuses.
 .BR \-b ", " \-\-base " " \fINAME\fR
 Use
 .I NAME
-as the base branch instead of origin's default.
+as the base branch instead of the pull request's base.
 .TP
 .BR \-n ", " \-\-dry\-run
 Print what would happen \(em the switch, fast-forward, and delete \(em without

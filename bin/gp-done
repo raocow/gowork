@@ -3,9 +3,11 @@
 # gp-done — switch back to the base branch and delete the branch you left.
 #
 # The bookend to `gp pr`: after you've checked out a PR's branch and finished
-# reviewing it, `gp done` returns you to the base (origin's default, usually
-# main), fast-forwards it to the latest on origin, and deletes the branch you
-# were on.
+# reviewing it, `gp done` returns you to the base, fast-forwards it to the
+# latest on origin, and deletes the branch you were on. The base is wherever
+# the branch's own PR merged (or is headed, if still open) — `next` in a repo
+# that stages work there, not just origin's default — falling back to
+# origin's default when the branch has no PR.
 #
 # Safe by default: only deletes the branch you left if it's actually merged
 # into the base — checked explicitly with `git merge-base --is-ancestor`, not
@@ -32,7 +34,7 @@
 # Usage:
 #   gp done            switch to the base branch, delete the branch you left
 #   gp done -f         force-delete (unmerged / squash-merged branches)
-#   gp done -b NAME    switch to NAME as the base instead of origin's default
+#   gp done -b NAME    switch to NAME as the base instead of the PR's base
 #   gp done -n         dry run — print what it would do, change nothing
 #   gp done -h         show this help
 #
@@ -73,8 +75,9 @@ usage() {
 gp done — switch back to the base branch and delete the branch you left.
 
 The bookend to `gp pr`: after reviewing a checked-out PR branch, return to the
-base (origin's default, usually main), fast-forward it to origin, and delete the
-branch you were on.
+base, fast-forward it to origin, and delete the branch you were on. The base is
+where the branch's own PR merged (or is headed, if still open) — `next`, say,
+in a repo that stages work there — else origin's default.
 
 Safe by default: only deletes the branch you left if it's actually merged into
 the base — checked explicitly (git merge-base --is-ancestor), not via a bare
@@ -92,7 +95,7 @@ Already on the base branch? There's nothing to delete, so it just pulls (fetch
 Usage:
   gp done          switch to the base branch, delete the branch you left
   gp done -f       force-delete (unmerged / squash-merged branches)
-  gp done -b NAME  use NAME as the base instead of origin's default
+  gp done -b NAME  use NAME as the base instead of the PR's base
   gp done -n       dry run — print what it would do, change nothing
   gp done -h       show this help
 EOF
@@ -120,7 +123,32 @@ detached=0
 current=$(git rev-parse --abbrev-ref HEAD)
 [ "$current" != "HEAD" ] || detached=1
 
-# Base = origin's default branch unless told otherwise (shared with sync/sweep).
+# Where to go back to. An explicit -b wins. Otherwise the branch this
+# branch's own PR merged into (or targets, if it's still open): a repo that
+# stages work on an integration branch merges feature PRs into `next`, not
+# main, and switching to main and judging mergedness there would refuse to
+# delete a branch whose work landed exactly where it was meant to. No PR, no
+# gh, offline, or a PR whose base has since been deleted: origin's default,
+# as before.
+#
+# Never looked up from origin's default branch itself, or a detached HEAD:
+# the default is where everything ends up, not something to leave, and a
+# PR that happens to have it as its head (main -> release, say) must not
+# send you off to that release branch.
+base_why=""
+default_base="$(resolve_base "")"
+if [ -z "$base" ] && [ "$detached" = 0 ] && [ "$current" != "$default_base" ]; then
+  if _pr_info="$(pr_base_for_branch "$current")"; then
+    IFS=$'\t' read -r _pr_base _pr_num <<< "$_pr_info"
+    if git show-ref --verify --quiet "refs/heads/$_pr_base" \
+       || git show-ref --verify --quiet "refs/remotes/origin/$_pr_base"; then
+      base="$_pr_base"
+      if [ "$base" != "$default_base" ]; then
+        base_why=" ${_dim}(#$_pr_num's base)${_off}"
+      fi
+    fi
+  fi
+fi
 base="$(resolve_base "$base")"
 
 git show-ref --verify --quiet "refs/heads/$base" \
@@ -141,7 +169,7 @@ fi
 
 if [ "$dry" = 1 ]; then
   echo "Would run:"
-  echo "  git switch $base"
+  echo "  git switch $base$base_why"
   echo "  git fetch origin --prune  &&  git merge --ff-only origin/$base"
   if [ "$detached" = 1 ]; then
     echo "  (detached HEAD — no branch to delete)"
@@ -155,7 +183,7 @@ fi
 
 # --- 1) switch to base (quietly; we narrate it ourselves) ---
 git switch --quiet "$base"
-step "switched to $base"
+step "switched to $base$base_why"
 
 # --- 2) fast-forward base to origin so you land on current main. ---
 _ff_base "$base"
