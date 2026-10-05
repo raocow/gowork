@@ -33,7 +33,7 @@ Git and pull requests:
   new         create a branch and switch to it
   switch      everything git switch does, plus worktree/PR-aware resolution
   sync        rebase branches onto their base
-  fork sync   catch a fork's base up with upstream, here and on origin
+  fork        sync | status | pr: keep a fork up to date, compare it, PR to upstream
   done        finish: merge-base check, push, delete branch
   sweep       delete merged branches (local and/or remote)
   wsweep      delete worktrees whose branches are gone

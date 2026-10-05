@@ -1,34 +1,44 @@
 #!/usr/bin/env bash
 #
-# gp-fork — keep a fork of someone else's repository up to date.
+# gp-fork — work with a fork of someone else's repository.
 #
 # A clone of a fork has two remotes: origin (your fork) and upstream (the
 # repository it was forked from — the name `gh repo fork --clone` gives it).
-# `gp fork sync` catches the fork's base branch up with upstream's, both here
-# and on origin: it's `git pull upstream <base> && git push origin <base>`,
-# but from any branch, and fast-forward only.
+# Every subcommand needs that upstream remote.
 #
-# Fast-forward only on both sides, never forced: a fork's base should only
-# ever follow upstream, so a base with commits of its own (here or on origin)
-# is left as is and reported, with a non-zero exit. The local base is updated
-# wherever it lives: in this worktree, in another one, or not checked out at
-# all. Uncommitted changes that a fast-forward would overwrite stop it there,
-# the same way `git merge --ff-only` would.
+# sync — catch the fork's base branch up with upstream's, both here and on
+# origin: `git pull upstream <base> && git push origin <base>`, but from any
+# branch, and fast-forward only on both sides, never forced. A fork's base
+# should only ever follow upstream, so a base with commits of its own (here or
+# on origin) is left as is and reported, with a non-zero exit. The local base
+# is updated wherever it lives: in this worktree, in another one, or not
+# checked out at all. Uncommitted changes that a fast-forward would overwrite
+# stop it there, the same way `git merge --ff-only` would. It only touches the
+# base; follow it with `gp sync` to rebase a feature branch onto it.
 #
-# It only touches the base. To rebase a feature branch onto the fresh base,
-# follow it with `gp sync`.
+# status — how the base here and on origin compare with upstream's, and which
+# of your branches (here or on origin) upstream doesn't have, with how many
+# commits each holds that upstream's base lacks. Read-only apart from a fetch.
+#
+# pr — `gh pr create` aimed at upstream: --repo is upstream, --head is
+# <your fork's owner>:<branch>, --base is the base. Plain `gh pr create` in a
+# fork can target the fork itself, depending on gh's default repo. Pushes the
+# branch to origin first when origin is missing it or behind (never forced);
+# every other argument goes to `gh pr create` unchanged (--title, --fill,
+# --draft, --web, ...).
 #
 # Usage:
-#   gp fork sync           catch origin's default branch up with upstream's
-#   gp fork sync -b NAME   that branch instead
-#   gp fork sync -n        dry run — print what it would do, change nothing
-#   gp fork -h             show this help
+#   gp fork sync [-b NAME] [-n]   catch the base up with upstream, here and on origin
+#   gp fork status [-b NAME]      ahead/behind upstream, and branches it doesn't have
+#   gp fork pr [gh pr create args...]   open a PR from this branch to upstream
+#   gp fork -h                    show this help
 #
 set -euo pipefail
 
 # Resolve this script's real location (following symlinks — it's installed as
 # one) to find lib/gitplus-common.sh, shared across the git-* tools:
-# step/warn, resolve_base(), worktree_path_for_branch() here.
+# step/warn, resolve_base(), worktree_path_for_branch(), require_gh(),
+# gh_scope_to_repo() here.
 _src="${BASH_SOURCE[0]}"
 while [ -h "$_src" ]; do
   _dir="$(cd -P "$(dirname "$_src")" && pwd)"
@@ -38,71 +48,63 @@ done
 source "$(cd -P "$(dirname "$_src")/.." && pwd)/lib/gitplus-common.sh"
 
 usage() {
-  cat <<'EOF'
-gp fork — keep a fork of someone else's repository up to date.
+  cat <<'HELP'
+gp fork — work with a fork of someone else's repository.
 
   gp fork sync           catch the fork's base branch up with upstream's:
                           fast-forward it here, then push it to origin
-  gp fork sync -b NAME   that branch instead of origin's default
-  gp fork sync -n        dry run — print what it would do, change nothing
+  gp fork status         how far the base here and on origin is from upstream's,
+                          and which of your branches upstream doesn't have
+  gp fork pr [args...]   open a pull request from this branch to upstream;
+                          args go to `gh pr create` (--title, --fill, --web...)
   gp fork -h             show this help
+
+  sync and status take -b NAME for a branch other than origin's default;
+  sync takes -n for a dry run.
 
 Needs an `upstream` remote for the original repository, as
 `gh repo fork --clone` sets up (or: git remote add upstream <url>).
 
-Works from any branch and only ever fast-forwards: a base with commits
+sync works from any branch and only ever fast-forwards: a base with commits
 upstream doesn't have is left as is and reported. It only touches the base;
 follow it with `gp sync` to rebase a feature branch onto it.
-EOF
+HELP
 }
 
-sub="${1:-}"
-case "$sub" in
-  -h|--help|help) usage; exit 0 ;;
-  sync) shift ;;
-  "") usage >&2; exit 2 ;;
-  *) echo "gp fork: unknown subcommand '$sub' (try: gp fork -h)" >&2; exit 2 ;;
-esac
+# The guard every subcommand shares.
+need_upstream() {  # need_upstream <command name>
+  require_git_repo "$1"
+  git remote get-url upstream >/dev/null 2>&1 || {
+    echo "$1: no 'upstream' remote — add the repository this was forked from:" >&2
+    echo "  git remote add upstream <url>" >&2
+    exit 1; }
+}
 
-dry=0
-base=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -h|--help) usage; exit 0 ;;
-    -n|--dry-run) dry=1 ;;
-    -b|--base) shift; base="${1:-}"
-      [ -n "$base" ] || { echo "gp fork sync: -b needs a branch name" >&2; exit 2; } ;;
-    *) echo "gp fork sync: unknown argument '$1' (try -h)" >&2; exit 2 ;;
-  esac
-  shift
-done
+# Fetch both remotes and check upstream has the base.
+fetch_both() {  # fetch_both <command name>
+  git fetch --quiet upstream --prune
+  git fetch --quiet origin --prune
+  git show-ref --verify --quiet "refs/remotes/upstream/$base" || {
+    echo "$1: upstream has no '$base' branch (pick one with -b)" >&2; exit 1; }
+}
 
-require_git_repo "gp fork sync"
-git remote get-url upstream >/dev/null 2>&1 || {
-  echo "gp fork sync: no 'upstream' remote — add the repository this was forked from:" >&2
-  echo "  git remote add upstream <url>" >&2
-  exit 1; }
-
-base="$(resolve_base "$base")"
-git fetch --quiet upstream --prune
-git fetch --quiet origin --prune
-git show-ref --verify --quiet "refs/remotes/upstream/$base" || {
-  echo "gp fork sync: upstream has no '$base' branch (pick one with -b)" >&2; exit 1; }
-
-up="$(git rev-parse "refs/remotes/upstream/$base")"
-here="$(git rev-parse -q --verify "refs/heads/$base" || true)"
-there="$(git rev-parse -q --verify "refs/remotes/origin/$base" || true)"
-rc=0
-
-# Where the local base lives: "." when checked out in this worktree, another
-# worktree's path, or empty when it isn't checked out anywhere (then the ref is
-# moved directly — no checkout needed to fast-forward a branch).
-dir=""
-if [ "$(git rev-parse --abbrev-ref HEAD)" = "$base" ]; then
-  dir="."
-elif wt="$(worktree_path_for_branch "$base")"; then
-  dir="$wt"
-fi
+# Parse the shared -b/-n flags into $base and $dry; $2 says whether -n is allowed.
+parse_flags() {  # parse_flags <command name> <allow -n: 0|1> [args...]
+  local me="$1" allow_n="$2"; shift 2
+  dry=0; base=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      -n|--dry-run)
+        [ "$allow_n" = 1 ] || { echo "$me: unknown argument '$1' (try -h)" >&2; exit 2; }
+        dry=1 ;;
+      -b|--base) shift; base="${1:-}"
+        [ -n "$base" ] || { echo "$me: -b needs a branch name" >&2; exit 2; } ;;
+      *) echo "$me: unknown argument '$1' (try -h)" >&2; exit 2 ;;
+    esac
+    shift
+  done
+}
 
 # "N new commit(s)": what <to> has that <from> lacks.
 new_commits() {
@@ -110,74 +112,230 @@ new_commits() {
   if [ "$n" = 1 ]; then echo "1 new commit"; else echo "$n new commits"; fi
 }
 
-if [ "$dry" = 1 ]; then
-  echo "Against 'upstream/$base', would:"
-  if [ -z "$here" ]; then
-    echo "  (no local '$base' — nothing to fast-forward here)"
-  elif [ "$here" = "$up" ]; then
-    echo "  leave $base: already up to date"
-  elif git merge-base --is-ancestor "$here" "$up"; then
-    echo "  fast-forward $base ($(new_commits "$here" "$up"))"
-  else
-    echo "  leave $base: it has commits upstream/$base doesn't"
-  fi
-  if [ "$there" = "$up" ]; then
-    echo "  leave origin/$base: already up to date"
-  elif [ -z "$there" ] || git merge-base --is-ancestor "$there" "$up"; then
-    echo "  push to origin/$base"
-  else
-    echo "  leave origin/$base: it has commits upstream/$base doesn't"
-  fi
-  echo
-  echo "Run without --dry-run to actually sync."
-  exit 0
-fi
+# owner/repo from a remote's configured URL — git@alias:owner/repo.git,
+# https://github.com/owner/repo, ssh://git@host/owner/repo all work. The raw
+# config value on purpose: `git remote get-url` applies insteadOf rewrites.
+remote_slug() {  # remote_slug <remote>
+  local u rest
+  u="$(git config --get "remote.$1.url")"
+  u="${u%/}"; u="${u%.git}"
+  rest="${u%/*}"
+  printf '%s/%s\n' "${rest##*[/:]}" "${u##*/}"
+}
 
-# ── The local base ──────────────────────────────────────────────────────────
-local_ok=""    # set when the local base was already at upstream's tip (one combined line)
-if [ -z "$here" ]; then
-  :
-elif [ "$here" = "$up" ]; then
-  local_ok=1
-elif ! git merge-base --is-ancestor "$here" "$up"; then
-  warn "$base has commits upstream/$base doesn't — left as is (see: git log upstream/$base..$base)"
-  rc=1
-else
-  n="$(new_commits "$here" "$up")"
-  if [ -n "$dir" ]; then
-    if git -C "$dir" merge --quiet --ff-only "$up" >/dev/null 2>&1; then
-      step "$base fast-forwarded to upstream/$base ${_dim}($n)${_off}"
+# ══════════════════════════════════════════════════════════════════════════
+# sync
+# ══════════════════════════════════════════════════════════════════════════
+cmd_sync() {
+  parse_flags "gp fork sync" 1 "$@"
+  need_upstream "gp fork sync"
+  base="$(resolve_base "$base")"
+  fetch_both "gp fork sync"
+
+
+  up="$(git rev-parse "refs/remotes/upstream/$base")"
+  here="$(git rev-parse -q --verify "refs/heads/$base" || true)"
+  there="$(git rev-parse -q --verify "refs/remotes/origin/$base" || true)"
+  rc=0
+
+  # Where the local base lives: "." when checked out in this worktree, another
+  # worktree's path, or empty when it isn't checked out anywhere (then the ref is
+  # moved directly — no checkout needed to fast-forward a branch).
+  dir=""
+  if [ "$(git rev-parse --abbrev-ref HEAD)" = "$base" ]; then
+    dir="."
+  elif wt="$(worktree_path_for_branch "$base")"; then
+    dir="$wt"
+  fi
+
+  if [ "$dry" = 1 ]; then
+    echo "Against 'upstream/$base', would:"
+    if [ -z "$here" ]; then
+      echo "  (no local '$base' — nothing to fast-forward here)"
+    elif [ "$here" = "$up" ]; then
+      echo "  leave $base: already up to date"
+    elif git merge-base --is-ancestor "$here" "$up"; then
+      echo "  fast-forward $base ($(new_commits "$here" "$up"))"
     else
-      where=""; [ "$dir" = . ] || where=" in $dir"
-      warn "couldn't fast-forward $base$where — uncommitted changes in the way?"
-      rc=1
+      echo "  leave $base: it has commits upstream/$base doesn't"
+    fi
+    if [ "$there" = "$up" ]; then
+      echo "  leave origin/$base: already up to date"
+    elif [ -z "$there" ] || git merge-base --is-ancestor "$there" "$up"; then
+      echo "  push to origin/$base"
+    else
+      echo "  leave origin/$base: it has commits upstream/$base doesn't"
+    fi
+    echo
+    echo "Run without --dry-run to actually sync."
+    exit 0
+  fi
+
+  # ── The local base ──────────────────────────────────────────────────────────
+  local_ok=""    # set when the local base was already at upstream's tip (one combined line)
+  if [ -z "$here" ]; then
+    :
+  elif [ "$here" = "$up" ]; then
+    local_ok=1
+  elif ! git merge-base --is-ancestor "$here" "$up"; then
+    warn "$base has commits upstream/$base doesn't — left as is (see: git log upstream/$base..$base)"
+    rc=1
+  else
+    n="$(new_commits "$here" "$up")"
+    if [ -n "$dir" ]; then
+      if git -C "$dir" merge --quiet --ff-only "$up" >/dev/null 2>&1; then
+        step "$base fast-forwarded to upstream/$base ${_dim}($n)${_off}"
+      else
+        where=""; [ "$dir" = . ] || where=" in $dir"
+        warn "couldn't fast-forward $base$where — uncommitted changes in the way?"
+        rc=1
+      fi
+    else
+      git update-ref "refs/heads/$base" "$up" "$here"
+      step "$base fast-forwarded to upstream/$base ${_dim}($n)${_off}"
+    fi
+  fi
+
+  # ── origin's base ───────────────────────────────────────────────────────────
+  # Pushes upstream's tip itself, not the local branch: the fork follows upstream
+  # even when the local base was left alone. A plain push, so origin refuses it
+  # if the fork's base has commits of its own.
+  if [ "$there" = "$up" ]; then
+    if [ -n "$local_ok" ]; then
+      step "$base already up to date with upstream/$base, here and on origin"
+    else
+      step "origin/$base already up to date with upstream/$base"
+    fi
+  elif git push --quiet origin "$up:refs/heads/$base" >/dev/null 2>&1; then
+    if [ -n "$local_ok" ]; then
+      step "$base already up to date with upstream/$base; pushed it to origin, which was behind"
+    else
+      step "pushed to origin/$base"
     fi
   else
-    git update-ref "refs/heads/$base" "$up" "$here"
-    step "$base fast-forwarded to upstream/$base ${_dim}($n)${_off}"
+    if [ -n "$local_ok" ]; then step "$base already up to date with upstream/$base"; fi
+    warn "origin refused the push — your fork's $base has commits upstream doesn't (see: git log upstream/$base..origin/$base)"
+    rc=1
   fi
-fi
 
-# ── origin's base ───────────────────────────────────────────────────────────
-# Pushes upstream's tip itself, not the local branch: the fork follows upstream
-# even when the local base was left alone. A plain push, so origin refuses it
-# if the fork's base has commits of its own.
-if [ "$there" = "$up" ]; then
-  if [ -n "$local_ok" ]; then
-    step "$base already up to date with upstream/$base, here and on origin"
-  else
-    step "origin/$base already up to date with upstream/$base"
-  fi
-elif git push --quiet origin "$up:refs/heads/$base" >/dev/null 2>&1; then
-  if [ -n "$local_ok" ]; then
-    step "$base already up to date with upstream/$base; pushed it to origin, which was behind"
-  else
-    step "pushed to origin/$base"
-  fi
-else
-  if [ -n "$local_ok" ]; then step "$base already up to date with upstream/$base"; fi
-  warn "origin refused the push — your fork's $base has commits upstream doesn't (see: git log upstream/$base..origin/$base)"
-  rc=1
-fi
+  exit "$rc"
+}
 
-exit "$rc"
+# ══════════════════════════════════════════════════════════════════════════
+# status
+# ══════════════════════════════════════════════════════════════════════════
+
+# "up to date", "3 behind", "2 ahead", "2 ahead, 3 behind", relative to <to>.
+compare() {  # compare <ref> <to>
+  local counts ahead behind
+  counts="$(git rev-list --left-right --count "$1...$2")"
+  ahead="${counts%%[[:space:]]*}"; behind="${counts##*[[:space:]]}"
+  if   [ "$ahead" = 0 ] && [ "$behind" = 0 ]; then echo "up to date"
+  elif [ "$ahead" = 0 ]; then echo "$behind behind"
+  elif [ "$behind" = 0 ]; then echo "$ahead ahead"
+  else echo "$ahead ahead, $behind behind"; fi
+}
+
+cmd_status() {
+  parse_flags "gp fork status" 0 "$@"
+  need_upstream "gp fork status"
+  base="$(resolve_base "$base")"
+  fetch_both "gp fork status"
+
+  local up_ref="refs/remotes/upstream/$base" b ref where n w=0 names=""
+  echo "Against upstream/$base ($(git rev-parse --short "$up_ref")):"
+  if git show-ref --verify --quiet "refs/heads/$base"; then
+    printf '  %-16s %s\n' "$base" "$(compare "refs/heads/$base" "$up_ref")"
+  fi
+  if git show-ref --verify --quiet "refs/remotes/origin/$base"; then
+    printf '  %-16s %s\n' "origin/$base" "$(compare "refs/remotes/origin/$base" "$up_ref")"
+  else
+    printf '  %-16s %s\n' "origin/$base" "missing"
+  fi
+
+  # Your branches, here or on origin, by a name upstream doesn't have.
+  names="$( { git for-each-ref --format='%(refname:short)' refs/heads/
+              git for-each-ref --format='%(refname:lstrip=3)' refs/remotes/origin/; } \
+            | grep -vx -e HEAD -e "$base" | sort -u || true)"
+  local mine=""
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    git show-ref --verify --quiet "refs/remotes/upstream/$b" && continue
+    mine="$mine$b"$'\n'
+    [ "${#b}" -gt "$w" ] && w="${#b}"
+  done <<< "$names"
+
+  echo
+  if [ -z "$mine" ]; then
+    echo "Every branch of yours is on upstream too."
+    return 0
+  fi
+  echo "Branches upstream doesn't have:"
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    if git show-ref --verify --quiet "refs/heads/$b"; then
+      ref="refs/heads/$b"
+      if git show-ref --verify --quiet "refs/remotes/origin/$b"; then
+        where="here and on origin"; else where="here only"; fi
+    else
+      ref="refs/remotes/origin/$b"; where="on origin only"
+    fi
+    n="$(git rev-list --count "$up_ref..$ref")"
+    if [ "$n" = 0 ]; then n="merged into upstream/$base"
+    elif [ "$n" = 1 ]; then n="1 commit upstream/$base lacks"
+    else n="$n commits upstream/$base lacks"; fi
+    printf "  %-${w}s  %-18s  %s\n" "$b" "$where" "$n"
+  done <<< "$mine"
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# pr
+# ══════════════════════════════════════════════════════════════════════════
+cmd_pr() {
+  case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+  need_upstream "gp fork pr"
+  require_gh "gp fork pr"
+  gh_scope_to_repo
+
+  local branch up_slug owner has_base=0 a
+  branch="$(git rev-parse --abbrev-ref HEAD)"
+  [ "$branch" != HEAD ] || { echo "gp fork pr: detached HEAD — check out a branch first" >&2; exit 1; }
+  base="$(resolve_base "")"
+  [ "$branch" != "$base" ] || {
+    echo "gp fork pr: you're on $base — open the PR from a feature branch" >&2; exit 1; }
+  up_slug="$(remote_slug upstream)"
+  owner="$(remote_slug origin)"; owner="${owner%%/*}"
+
+  # The branch has to be on origin for upstream to see it: push it when origin
+  # lacks it or is behind, never forced.
+  git fetch --quiet origin
+  if ! git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    git push --quiet -u origin "$branch"
+    step "pushed $branch to origin"
+  elif [ "$(git rev-parse "refs/remotes/origin/$branch")" != "$(git rev-parse HEAD)" ]; then
+    if git merge-base --is-ancestor "refs/remotes/origin/$branch" HEAD; then
+      git push --quiet origin "$branch"
+      step "pushed $branch to origin"
+    else
+      echo "gp fork pr: origin/$branch has commits this branch doesn't — pull or rebase first" >&2
+      exit 1
+    fi
+  fi
+
+  # Our --base only when the caller didn't pick one.
+  for a in "$@"; do
+    case "$a" in -B|--base|--base=*) has_base=1 ;; esac
+  done
+  if [ "$has_base" = 1 ]; then
+    exec gh pr create --repo "$up_slug" --head "$owner:$branch" "$@"
+  fi
+  exec gh pr create --repo "$up_slug" --head "$owner:$branch" --base "$base" "$@"
+}
+
+sub="${1:-}"
+case "$sub" in
+  -h|--help|help) usage; exit 0 ;;
+  sync|status|pr) shift; "cmd_$sub" "$@" ;;
+  "") usage >&2; exit 2 ;;
+  *) echo "gp fork: unknown subcommand '$sub' (try: gp fork -h)" >&2; exit 2 ;;
+esac

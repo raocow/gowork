@@ -1,10 +1,16 @@
-.TH GP-FORK 1 "2026-10-04" "gitplus" "gitplus Manual"
+.TH GP-FORK 1 "2026-10-05" "gitplus" "gitplus Manual"
 .SH NAME
-gp-fork \- keep a fork of someone else's repository up to date
+gp-fork \- work with a fork of someone else's repository
 .SH SYNOPSIS
 .B gp fork sync
 [\fB\-b\fR|\fB\-\-base\fR \fINAME\fR]
 [\fB\-n\fR|\fB\-\-dry\-run\fR]
+.br
+.B gp fork status
+[\fB\-b\fR|\fB\-\-base\fR \fINAME\fR]
+.br
+.B gp fork pr
+[\fIgh pr create options\fR ...]
 .br
 .B gp fork
 [\fB\-h\fR|\fB\-\-help\fR]
@@ -17,9 +23,12 @@ A clone of a fork has two remotes:
 .B gh repo fork \-\-clone
 gives it; otherwise add it with
 .BR "git remote add upstream <url>" ).
-.PP
-.B gp fork sync
-catches the fork's base branch up with upstream's, both in your clone and on
+Every subcommand needs that upstream remote. The base is origin's default
+branch unless
+.B \-b
+names another.
+.SS sync
+Catch the fork's base branch up with upstream's, both in your clone and on
 origin. It does what
 .B git pull upstream <base> && git push origin <base>
 does, but from any branch, and it only ever fast-forwards. The local base is
@@ -35,21 +44,68 @@ It only touches the base branch. To rebase a feature branch onto the fresh
 base, follow it with
 .BR "gp sync" ,
 which works against origin as usual.
+.SS status
+Fetch both remotes, then show how the base here and on origin compares with
+upstream's (up to date, ahead, behind), and list your branches, here or on
+origin, whose names upstream doesn't have. Each shows where it lives (here
+only, on origin only, or both) and how many commits it holds that upstream's
+base lacks;
+.I merged into upstream/<base>
+means none, so the branch can go. Changes nothing apart from the fetch.
+.SS pr
+Open a pull request from the current branch to upstream: runs
+.B gh pr create
+with
+.B \-\-repo
+set to upstream,
+.B \-\-head
+set to
+.IR <your-fork's-owner>:<branch> ,
+and
+.B \-\-base
+set to the base unless you pass
+.B \-B
+or
+.B \-\-base
+yourself. Plain
+.B gh pr create
+in a fork can open the pull request against the fork itself, depending on
+which repository gh treats as the default.
+.PP
+The branch is pushed to origin first when origin lacks it or is behind (never
+forced). If origin's copy has commits yours doesn't, it stops and asks you to
+pull or rebase. It refuses to run on the base branch. Every argument goes to
+.B gh pr create
+unchanged, so
+.BR \-\-title ,
+.BR \-\-body ,
+.BR \-\-fill ,
+.BR \-\-draft
+and
+.B \-\-web
+all work. The owner and repository names are read from the remotes' URLs.
 .SH OPTIONS
 .TP
 .BR \-b ", " \-\-base " " \fINAME\fR
-Sync
+(sync, status) Use
 .I NAME
 instead of origin's default branch.
 .TP
 .BR \-n ", " \-\-dry\-run
-Fetch, then print what would happen without changing anything.
+(sync) Fetch, then print what would happen without changing anything.
 .TP
 .BR \-h ", " \-\-help
 Show usage and exit.
 .SH EXIT STATUS
-0 when the base is up to date with upstream, both here and on origin; 1 when
-something was left as is or a guard failed; 2 for a usage error.
+.B sync
+exits 0 when the base is up to date with upstream, both here and on origin,
+and 1 when something was left as is.
+.B status
+exits 0.
+.B pr
+exits with
+.BR gh 's
+status. Any subcommand exits 1 when a guard fails and 2 for a usage error.
 .SH EXAMPLES
 .TP
 .B gp fork sync
@@ -57,7 +113,19 @@ Pull upstream's latest base into your clone and push it to your fork.
 .TP
 .B gp fork sync && gp sync
 Then rebase the current feature branch onto it and push.
+.TP
+.B gp fork status
+See what upstream has that you don't, and which of your branches it lacks.
+.TP
+.B gp fork pr \-\-fill \-\-draft
+Push the current branch to your fork and open a draft pull request to upstream.
+.SH REQUIREMENTS
+.B pr
+needs the GitHub CLI
+.RB ( gh ),
+signed in to an account that can open pull requests on upstream.
 .SH SEE ALSO
 .BR gp-sync (1),
 .BR gowork (1),
+.BR gh-pr-create (1),
 .BR gh-repo-fork (1)

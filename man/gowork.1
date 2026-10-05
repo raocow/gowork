@@ -46,10 +46,11 @@ Branch and worktree workflow; see each
 .BR gp- <command>(1)
 page.
 .TP
-.B fork sync
-Catch a fork's base branch up with the repository it was forked from (the
+.B fork sync\fR|\fBstatus\fR|\fBpr
+Work with a fork of another repository (the
 .I upstream
-remote), here and on origin. See
+remote): catch its base branch up, here and on origin; compare it and your
+branches with upstream; open a pull request to upstream. See
 .BR gp-fork (1).
 .TP
 .B account setup\fR|\fBstatus\fR|\fBoff
