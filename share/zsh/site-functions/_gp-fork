@@ -1,0 +1,14 @@
+#autoload
+#
+# Completion for `gp fork sync` — the subcommand, then its flags and -b values.
+if (( CURRENT == 2 )); then
+  local -a subs=('sync:catch the base up with upstream, here and on origin')
+  _describe 'fork command' subs; return
+fi
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  _message -r 'not inside a git repository'; return
+fi
+case ${words[CURRENT-1]} in
+  -b|--base) _gitplus_branch_names; return ;;
+esac
+_alternative 'flags:Flag:(-b --base -n --dry-run -h --help)'

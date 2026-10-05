@@ -20,6 +20,7 @@ Commands:
   sweep       delete merged branches (local and/or remote)
   done        finish: merge-base check, push, delete branch
   sync        rebase branches onto their base
+  fork        keep a fork up to date with upstream (fork sync)
   switch      everything `git switch` does, plus worktree/PR-aware resolution
   new         create a branch and switch to it
   release     tag and publish a GitHub release

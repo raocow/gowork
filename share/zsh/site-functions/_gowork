@@ -18,6 +18,7 @@ case $state in
       'new:create a branch'
       'switch:git switch, plus worktree/PR resolution'
       'sync:rebase branches onto base'
+      'fork:keep a fork up to date with upstream'
       'done:finish current branch'
       'sweep:delete merged branches'
       'wsweep:delete stale worktrees'

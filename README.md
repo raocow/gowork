@@ -41,6 +41,7 @@ names for that reason.
 |---|---|---|
 | `gw pr`, `gw pl`, `gw pm` | pull requests: list, check out, merge, close, unmerge | `gp pr`, `gp pl`, `gp pm` |
 | `gw new`, `switch`, `sync`, `done`, `sweep`, `wsweep`, `haspr`, `release` | branch and worktree workflow | `gp …` |
+| `gw fork sync` | catch a fork's base up with upstream, in your clone and on GitHub | — |
 | `gw account setup\|status\|off` | gh/aws shims, git routing, Claude sandbox wiring | `rigor identity …` |
 | `gw account add\|bind\|unbind\|list\|key` | per-directory GitHub accounts | `gp account …` |
 | `gw account register\|check\|sweep` | SSH keys on GitHub; dead bindings | `gp account …` |

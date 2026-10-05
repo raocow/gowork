@@ -1,0 +1,63 @@
+.TH GP-FORK 1 "2026-10-04" "gitplus" "gitplus Manual"
+.SH NAME
+gp-fork \- keep a fork of someone else's repository up to date
+.SH SYNOPSIS
+.B gp fork sync
+[\fB\-b\fR|\fB\-\-base\fR \fINAME\fR]
+[\fB\-n\fR|\fB\-\-dry\-run\fR]
+.br
+.B gp fork
+[\fB\-h\fR|\fB\-\-help\fR]
+.SH DESCRIPTION
+A clone of a fork has two remotes:
+.I origin
+(your fork) and
+.I upstream
+(the repository it was forked from, the name
+.B gh repo fork \-\-clone
+gives it; otherwise add it with
+.BR "git remote add upstream <url>" ).
+.PP
+.B gp fork sync
+catches the fork's base branch up with upstream's, both in your clone and on
+origin. It does what
+.B git pull upstream <base> && git push origin <base>
+does, but from any branch, and it only ever fast-forwards. The local base is
+updated wherever it lives: in this worktree, in another worktree, or not
+checked out at all. Upstream's tip is then pushed to origin with a plain push,
+never forced.
+.PP
+A fork's base should only follow upstream, so a base with commits of its own
+is left as is and reported, here or on origin, and the exit status is 1. So
+is a fast-forward that uncommitted changes would overwrite.
+.PP
+It only touches the base branch. To rebase a feature branch onto the fresh
+base, follow it with
+.BR "gp sync" ,
+which works against origin as usual.
+.SH OPTIONS
+.TP
+.BR \-b ", " \-\-base " " \fINAME\fR
+Sync
+.I NAME
+instead of origin's default branch.
+.TP
+.BR \-n ", " \-\-dry\-run
+Fetch, then print what would happen without changing anything.
+.TP
+.BR \-h ", " \-\-help
+Show usage and exit.
+.SH EXIT STATUS
+0 when the base is up to date with upstream, both here and on origin; 1 when
+something was left as is or a guard failed; 2 for a usage error.
+.SH EXAMPLES
+.TP
+.B gp fork sync
+Pull upstream's latest base into your clone and push it to your fork.
+.TP
+.B gp fork sync && gp sync
+Then rebase the current feature branch onto it and push.
+.SH SEE ALSO
+.BR gp-sync (1),
+.BR gowork (1),
+.BR gh-repo-fork (1)
