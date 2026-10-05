@@ -31,6 +31,8 @@ user=""; prev=""
 for a in "$@"; do [ "$prev" = --user ] && user="$a"; prev="$a"; done
 case "$1 $2" in
   "auth token") echo "tok-$user"; exit 0 ;;
+  "auth status") echo "  - account $(cat "$HOME/active" 2>/dev/null || echo work-gh)"; exit 0 ;;
+  "auth refresh"|"auth login") echo "$2 GH_BROWSER=${GH_BROWSER:-}" >> "$HOME/gh-auth"; exit 0 ;;
   "api user/orgs")
     case "$GH_TOKEN" in
       tok-work-gh) printf 'ClientOrg\nshared-org\n' ;;
@@ -159,6 +161,26 @@ nosaw "removed app rule" "$r" "Slack"
 nosaw "removed from the config" "$(cat "$TMP/.finicky.js")" "sharepoint"
 out="$("$GW" browser remove nothing.example 2>&1)"; rc=$?
 check "removing a missing rule fails" "$rc" "1"
+
+echo "== gh device logins open in the account's browser =="
+# The gh shim first on PATH, the fake gh after it, as `gw account setup` lays them out.
+SHIMDIR="$TMP/shim"; mkdir -p "$SHIMDIR"; ln -sf "$ROOT/share/rigor/identity/gh" "$SHIMDIR/gh"
+shimgh() { (cd "${2:-$TMP}" && PATH="$SHIMDIR:$PATH" GH_TMP="$TMP" gh auth "$1" >/dev/null 2>&1); }
+rm -f "$TMP/gh-auth"; echo work-gh > "$TMP/active"
+shimgh refresh
+saw "refresh: active account's browser" "$(cat "$TMP/gh-auth")" "refresh GH_BROWSER=$ROOT/libexec/gowork-browser open work-gh"
+rm -f "$TMP/gh-auth"
+shimgh login "$TMP/code/me/tool"
+saw "login: the directory's account" "$(cat "$TMP/gh-auth")" "login GH_BROWSER=$ROOT/libexec/gowork-browser open me-gh"
+rm -f "$TMP/gh-auth"
+shimgh login "$TMP"
+check "login outside any binding: default browser" "$(cat "$TMP/gh-auth")" "login GH_BROWSER="
+rm -f "$TMP/gh-auth"
+(cd "$TMP" && PATH="$SHIMDIR:$PATH" GH_BROWSER=mine gh auth refresh >/dev/null 2>&1)
+check "explicit GH_BROWSER is kept" "$(cat "$TMP/gh-auth")" "refresh GH_BROWSER=mine"
+rm -f "$TMP/opened"
+GOWORK_OPEN="$FAKE/open" "$GW" browser open work-gh https://github.com/login/device
+check "open accepts a gh login for the account" "$(cat "$TMP/opened")" "open -a Island https://github.com/login/device"
 
 echo "== open / status / off =="
 rm -f "$TMP/opened"

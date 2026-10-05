@@ -55,7 +55,32 @@ if [[ -n "${RIGOR_IDENTITY_RESOLVE:-}" ]]; then
   resolve=1
 else
   case "${1:-} ${2:-}" in
-    "auth login"*|"auth logout"*|"auth switch"*|"auth refresh"*) exec "$real" "$@" ;;
+    "auth login"*|"auth refresh"*)
+      # These open GitHub's device page, which is the same URL for every
+      # account, so a browser router can't tell whose login it is. Decide
+      # here: refresh acts on gh's active account; login on the account bound
+      # to this directory. gw browser opens that account's browser (Island,
+      # a Chrome profile…). An explicit GH_BROWSER is left alone.
+      if [[ -z "${GH_BROWSER:-}" && -z "${RIGOR_IDENTITY_OFF:-}" ]]; then
+        _s="${BASH_SOURCE[0]}"
+        while [ -h "$_s" ]; do
+          _d="$(cd -P "$(dirname "$_s")" && pwd)"; _s="$(readlink "$_s")"
+          [[ "$_s" != /* ]] && _s="$_d/$_s"
+        done
+        helper="$(cd -P "$(dirname "$_s")/../../.." 2>/dev/null && pwd)/libexec/gowork-browser"
+        who=""
+        if [[ "$2" == refresh ]]; then
+          who="$(env -u GH_TOKEN -u GITHUB_TOKEN "$real" auth status --active --hostname github.com 2>/dev/null \
+                 | sed -n 's/.*account \([^ ]*\).*/\1/p' | head -1)" || true
+        elif command -v gp-account >/dev/null 2>&1; then
+          who="$(_RIGOR_GH_SHIM=1 gp-account _gh-for-dir "$PWD" 2>/dev/null)" || true
+        fi
+        if [[ -n "$who" && -x "$helper" ]] && "$helper" has "$who" 2>/dev/null; then
+          export GH_BROWSER="$helper open $who"
+        fi
+      fi
+      exec "$real" "$@" ;;
+    "auth logout"*|"auth switch"*) exec "$real" "$@" ;;
   esac
 fi
 

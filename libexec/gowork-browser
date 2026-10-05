@@ -76,8 +76,15 @@ map_rows() {
   awk -F'\t' -v c="$CHROME" 'NF == 3 { print $1 "\t" c "\t" $2 "\t" $3; next } NF >= 4 { print $1 "\t" $2 "\t" $3 "\t" $4 }' "$MAP"
 }
 
-map_get() {  # map_get <account> -> "<browser>\t<dir>\t<profile>"
-  map_rows | awk -F'\t' -v a="$1" '$1 == a && !f { print $2 "\t" $3 "\t" $4; f = 1 } END { exit !f }'
+map_get() {  # map_get <account or its gh user> -> "<browser>\t<dir>\t<profile>"
+  local a="$1"
+  if ! map_rows | awk -F'\t' -v a="$a" '$1 == a { f = 1 } END { exit !f }'; then
+    # Callers that only know the GitHub login (gh's active account) may pass
+    # that instead of gowork's account name.
+    local n; n="$(acct_list | awk -v u="$a" '/^[^ ]/ { cur = $1 } $1 == "gh:" && $2 == u && !d { print cur; d = 1 }')"
+    [ -n "$n" ] && a="$n"
+  fi
+  map_rows | awk -F'\t' -v a="$a" '$1 == a && !f { print $2 "\t" $3 "\t" $4; f = 1 } END { exit !f }'
 }
 
 # Read `gp-account list` once. Piping it straight into an awk that stops at its
@@ -370,6 +377,7 @@ case "${1:-}" in
   status) status ;;
   off)    off ;;
   open)   shift; open_as "$@" ;;
+  has)    shift; map_get "${1:-}" >/dev/null 2>&1 ;;   # quiet: does this account have a browser?
   add)    shift; add_rule "$@" ;;
   remove|rm) shift; remove_rule "$@" ;;
   rules)  list_rules ;;
