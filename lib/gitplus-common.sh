@@ -138,6 +138,32 @@ pr_merged_into() {
   printf '%s\n' "$n"
 }
 
+# pr_base_for_branch <branch> — where <branch>'s own pull request goes, as
+# "<base><TAB><number>"; prints nothing and returns 1 if it has none. A merged
+# PR wins (the most recently merged, if there were several), else an open
+# one. A closed, unmerged PR says nothing about where the work belongs, so
+# it's ignored. So are PRs from forks: `gh pr list --head` matches the branch
+# NAME across every fork, and someone else's same-named branch isn't yours.
+#
+# This is how `gp done` knows where you came from. A repo that stages work on
+# an integration branch (feature -> next -> main) merges feature PRs into
+# next, not main; switching to main afterwards and judging mergedness there
+# refuses to delete a branch whose work landed exactly where it was meant to.
+pr_base_for_branch() {
+  local branch="$1" out
+  gh_scope_to_repo
+  command -v gh >/dev/null 2>&1 || return 1
+  out="$(gh pr list --head "$branch" --state all --limit 20 \
+    --json number,baseRefName,state,mergedAt,isCrossRepository \
+    --jq '[.[] | select(.isCrossRepository | not)] as $p
+          | ([$p[] | select(.state == "MERGED")] | sort_by(.mergedAt) | last)
+            // ([$p[] | select(.state == "OPEN")] | first)
+            // empty
+          | "\(.baseRefName)\t\(.number)"' 2>/dev/null || true)"
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
 # merged_pr_heads_into <base> — the head branch name of every merged PR that
 # reaches <base>, directly OR transitively through a chain of merged stacked
 # PRs, one per line. The batch form of pr_merged_into, for callers that have
