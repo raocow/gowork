@@ -318,20 +318,32 @@ cmd_doctor() {
   echo "VIRTUAL_ENV : ${VIRTUAL_ENV:-<none>}"
 }
 
+# 1 when `pmset -a disablesleep 1` is in effect, else 0.
+sleep_disabled() {
+  [ "$(pmset -g | awk '/SleepDisabled/ {print $2}')" = "1" ] && echo 1 || echo 0
+}
+
+# on/off refuse a no-op before sudo can ask for a password.
 cmd_sleep() {
   case "${1:-}" in
     off)
+      if [ "$(sleep_disabled)" = 1 ]; then
+        echo "rigor sleep: sleep is already disabled" >&2
+        return 1
+      fi
       sudo pmset -a disablesleep 1
       echo "sleep disabled — this Mac won't sleep until 'rigor sleep on'"
       ;;
     on)
+      if [ "$(sleep_disabled)" = 0 ]; then
+        echo "rigor sleep: sleep is already enabled" >&2
+        return 1
+      fi
       sudo pmset -a disablesleep 0
       echo "sleep re-enabled"
       ;;
     status)
-      local v
-      v="$(pmset -g | awk '/SleepDisabled/ {print $2}')"
-      if [ "$v" = "1" ]; then
+      if [ "$(sleep_disabled)" = 1 ]; then
         echo "sleep disabled (rigor sleep on to re-enable)"
       else
         echo "sleep enabled (normal)"

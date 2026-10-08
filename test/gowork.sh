@@ -74,6 +74,32 @@ saw "old gp name still works" "$out" "gp (gitplus)"
 out="$(PATH="$FAKE:$PATH" "$ROOT/bin/rigor" version 2>&1)"
 saw "old rigor name still works" "$out" "rigor "
 
+echo "== sleep =="
+# A pmset that reports $SLEEP_STATE and a sudo that only records, so no
+# password is ever asked for and no setting changes.
+cat > "$FAKE/pmset" <<'EOF2'
+#!/bin/sh
+printf ' SleepDisabled\t\t%s\n' "$SLEEP_STATE"
+EOF2
+cat > "$FAKE/sudo" <<EOF2
+#!/bin/sh
+echo "sudo \$*" >> "$TMP/sudo-calls"
+EOF2
+chmod +x "$FAKE/pmset" "$FAKE/sudo"
+for st in 0 1; do
+  if [ "$st" = 0 ]; then same=on; change=off; word=enabled; else same=off; change=on; word=disabled; fi
+  rm -f "$TMP/sudo-calls"
+  out="$(SLEEP_STATE=$st gw sleep "$same" 2>&1)"; rc=$?
+  check "sleep $same when already $word fails" "$rc" "1"
+  saw   "sleep $same when already $word says so" "$out" "sleep is already $word"
+  check "sleep $same when already $word never calls sudo" "$(cat "$TMP/sudo-calls" 2>/dev/null)" ""
+  out="$(SLEEP_STATE=$st gw sleep "$change" 2>&1)"; rc=$?
+  check "sleep $change from $word succeeds" "$rc" "0"
+  check "sleep $change from $word calls sudo pmset" "$(cat "$TMP/sudo-calls" 2>/dev/null)" \
+    "sudo pmset -a disablesleep $([ "$change" = off ] && echo 1 || echo 0)"
+done
+rm -f "$FAKE/pmset" "$FAKE/sudo"
+
 echo "== migrate =="
 # A setup the way rigor and gitplus left it: brew paths and checkout paths.
 OLDCO="$TMP/brew-tools"; mkdir -p "$OLDCO/rigor/bin" "$OLDCO/gitplus/bin"
