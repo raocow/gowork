@@ -6,6 +6,12 @@ gp-pr \- list, check out, merge, close, or revert pull requests
 [\fB\-nt\fR|\fB\-\-no\-title\fR]
 [\fB\-c\fR|\fB\-\-copy\fR]
 [\fB\-g\fR|\fB\-\-global\fR]
+[\fB\-\fIN\fR]
+.br
+.B gp pr
+.B latest
+[\fB\-\fIN\fR]
+[\fB\-x\fR \fIID\fR ...]
 .br
 .B gp pr
 .I NUMBER
@@ -49,6 +55,19 @@ With
 .B \-\-no\-title
 it prints just the URLs, one per line, for easy piping. Listing uses
 .BR "gh pr list \-\-author @me" .
+.PP
+.B gp pr latest
+(also
+.BR "gp pr list latest" ,
+or the shorthand
+.BR "gp pll" )
+lists the pull requests you authored that have merged in the current
+repository, most recently merged first, each with its merge date. It shows 10;
+.BI \- N
+shows
+.I N
+instead, as in
+.BR "gp pll \-50" .
 .PP
 Given a
 .IR NUMBER ,
@@ -371,6 +390,18 @@ active account. Listing only: takes no IDs, no
 .BR \-x ,
 and is not valid with
 .BR "gp pr merge" .
+.TP
+.BI \- N
+List at most
+.I N
+pull requests, as in
+.BR \-20 .
+Applies to any listing of your own PRs:
+.BR "gp pr" ,
+.BR "gp pr latest" ,
+and
+.BR \-g .
+Not valid with named IDs or with merge, close, or unmerge.
 .TP
 .BR \-a ", " \-\-all
 With

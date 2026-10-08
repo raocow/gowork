@@ -100,6 +100,55 @@ for st in 0 1; do
 done
 rm -f "$FAKE/pmset" "$FAKE/sudo"
 
+echo "== pr latest =="
+# A gh that answers `pr list` from canned JSON, run through the caller's own
+# --jq, so the ordering and formatting under test are the real ones. Merged
+# PRs come back in creation order, the way gh returns them; #7 was opened
+# first but merged last.
+cat > "$FAKE/gh" <<EOF2
+#!/usr/bin/env bash
+echo "gh \$*" >> "$TMP/gh-calls"
+[ "\$1 \$2" = "pr view" ] && { echo "\$3"; exit 0; }
+[ "\$1 \$2" = "pr list" ] || exit 0
+jq_expr=""; state=""
+while [ \$# -gt 0 ]; do
+  case "\$1" in --jq) jq_expr="\$2"; shift ;; --state) state="\$2"; shift ;; esac
+  shift
+done
+if [ "\$state" = merged ]; then
+  printf '%s' '[{"number":9,"url":"u/9","title":"nine","mergedAt":"2026-10-03T00:00:00Z"},
+               {"number":8,"url":"u/8","title":"eight","mergedAt":"2026-10-02T00:00:00Z"},
+               {"number":7,"url":"u/7","title":"seven","mergedAt":"2026-10-05T00:00:00Z"}]'
+else
+  printf '%s' '[{"number":12,"url":"u/12","title":"twelve"},{"number":11,"url":"u/11","title":"eleven"}]'
+fi | jq -r "\$jq_expr"
+EOF2
+chmod +x "$FAKE/gh"
+PRREPO="$TMP/prrepo"; git init -q "$PRREPO"
+pl() { (cd "$PRREPO" && PATH="$FAKE:$PATH" "$GW" "$@" 2>&1); }
+out="$(pl pll)"
+check "pll lists merged PRs, newest merge first" "$out" "u/7 -- seven (merged 2026-10-05)
+u/9 -- nine (merged 2026-10-03)
+u/8 -- eight (merged 2026-10-02)"
+check "pl latest is the same" "$(pl pl latest)" "$out"
+check "pll -2 shows two" "$(pl pll -2 -nt)" "u/7
+u/9"
+check "pll -x drops a PR before counting" "$(pl pll -2 -nt -x 7)" "u/9
+u/8"
+rm -f "$TMP/gh-calls"; pl pll -30 >/dev/null
+saw "pll asks for merged PRs by update time" "$(cat "$TMP/gh-calls")" "--state merged --search sort:updated-desc --limit 60"
+rm -f "$TMP/gh-calls"; out="$(pl pl -5)"
+check "pl still lists open PRs" "$out" "u/11 -- eleven
+u/12 -- twelve"
+saw "pl -5 limits the open listing" "$(cat "$TMP/gh-calls")" "--state open --limit 5"
+out="$(pl pll 3)"; rc=$?
+check "pll takes no ids" "$rc" "2"
+out="$(pl pm 3 -5)"; rc=$?
+check "a count doesn't apply to merge" "$rc" "2"
+out="$(pl pll -0)"; rc=$?
+check "pll -0 is refused" "$rc" "2"
+rm -f "$FAKE/gh"
+
 echo "== migrate =="
 # A setup the way rigor and gitplus left it: brew paths and checkout paths.
 OLDCO="$TMP/brew-tools"; mkdir -p "$OLDCO/rigor/bin" "$OLDCO/gitplus/bin"

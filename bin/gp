@@ -30,6 +30,7 @@ Commands:
 
 Shorthands:
   pl          = gp pr list
+  pll         = gp pr latest  (your last merged PRs; -N for how many)
   pm          = gp pr merge
 
   gp help     show this help
@@ -47,6 +48,7 @@ shift 2>/dev/null || true
 # rest of the arguments pass through untouched (`gp pl -a`, `gp pl 12 13`).
 case "$cmd" in
   pl) cmd=pr; set -- list ${1+"$@"} ;;
+  pll) cmd=pr; set -- latest ${1+"$@"} ;;
   pm) cmd=pr; set -- merge ${1+"$@"} ;;
 esac
 

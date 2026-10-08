@@ -157,6 +157,10 @@ gp pr — list your open PRs, check one out, or merge one or more.
   gp pr -nt                  list them as bare URLs (--no-title)
   gp pr -c                   also copy the listing to the clipboard (--copy;
                               works with any listing form, not merge)
+  gp pr latest               your most recently merged PRs in this repo,
+                              newest first (10; -N for N: latest -50)
+  gp pr -N                   list at most N (-20); works with any listing
+                              of your PRs: gp pr, latest, -g
   gp pr -g                   every open PR under EVERY gh account you're
                               logged into, across all repos (--global).
                               Works outside a repo. Listing only — no ids,
@@ -227,6 +231,8 @@ subcmd=""
 all=0
 dry=0
 method=""
+latest=0         # list recently merged PRs instead of open ones (`latest`, `pll`)
+limit=""         # -N: how many to list ("" = each listing's default)
 raw_targets=()   # positional args before -x: ids and/or "NNN-MMM" ranges
 raw_methods=()   # parallel to raw_targets: that id's merge method ("" = default)
 raw_excludes=()  # positional args after -x/--exclude
@@ -255,6 +261,12 @@ if [ "${1:-}" = "merge" ]; then subcmd="merge"; shift;
 elif [ "${1:-}" = "list" ]; then subcmd="list"; shift;
 elif [ "${1:-}" = "close" ]; then subcmd="close"; shift;
 elif [ "${1:-}" = "unmerge" ]; then subcmd="unmerge"; shift; fi
+# `latest` is a listing mode, not a PR: `gp pr latest` and `gp pr list latest`
+# both mean your recently merged PRs. Claiming the word shadows a branch
+# literally named "latest", which is a fair trade for a two-word command.
+if [ "${1:-}" = "latest" ] && { [ "$subcmd" = "" ] || [ "$subcmd" = "list" ]; }; then
+  subcmd="list"; latest=1; shift
+fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -265,6 +277,11 @@ while [ $# -gt 0 ]; do
     -a|--all) all=1; in_exclude=0 ;;
     -n|--dry-run) dry=1; in_exclude=0 ;;
     -x|--exclude) in_exclude=1 ;;
+    # -N sets how many to list (`gp pr latest -100`). A number is never a
+    # flag otherwise, so `-12` can't be mistaken for anything else.
+    -[0-9]*)
+      case "${1#-}" in *[!0-9]*) echo "gp pr: '$1' isn't a count (try -20)" >&2; exit 2 ;; esac
+      limit="${1#-}"; in_exclude=0 ;;
     # Same spellings gh pr merge uses, so they read the same way here.
     -s|--squash) _claim_pending squash; in_exclude=0 ;;
     -m|--merge)  _claim_pending merge;  in_exclude=0 ;;
@@ -288,6 +305,9 @@ if [ "$global" = 1 ]; then
   fi
   if [ "${#raw_targets[@]}" -gt 0 ] || [ "${#raw_excludes[@]}" -gt 0 ]; then
     echo "gp pr: -g/--global lists everything and takes no ids (or -x)" >&2; exit 2
+  fi
+  if [ "$latest" = 1 ]; then
+    echo "gp pr: -g/--global lists open PRs; 'latest' is per repo" >&2; exit 2
   fi
 fi
 
@@ -331,6 +351,18 @@ else
   if [ "$all" = 1 ] && [ "${#raw_targets[@]}" -gt 0 ]; then
     echo "gp pr: can't combine --all with specific PRs" >&2; exit 2
   fi
+  if [ "$latest" = 1 ] && [ "${#raw_targets[@]}" -gt 0 ]; then
+    echo "gp pr latest: takes no ids — it lists your recently merged PRs (-N for how many, -x to leave some out)" >&2; exit 2
+  fi
+  if [ -n "$limit" ] && [ "${#raw_targets[@]}" -gt 0 ]; then
+    echo "gp pr: -$limit limits a listing of your PRs; it doesn't apply to named ids" >&2; exit 2
+  fi
+fi
+if [ -n "$limit" ] && [ "$subcmd" != "" ] && [ "$subcmd" != "list" ]; then
+  echo "gp pr $subcmd: -$limit is a listing count; it doesn't apply here" >&2; exit 2
+fi
+if [ "$limit" = 0 ]; then
+  echo "gp pr: -0 would list nothing; give a count of 1 or more" >&2; exit 2
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -363,7 +395,7 @@ if [ "$global" = 1 ]; then
   for acct in $accounts; do
     atok="$(gh auth token --user "$acct" 2>/dev/null || true)"
     [ -n "$atok" ] || continue
-    arows="$(GH_TOKEN="$atok" gh search prs --author "@me" --state open --limit 100 \
+    arows="$(GH_TOKEN="$atok" gh search prs --author "@me" --state open --limit "${limit:-100}" \
       --json number,url,title,repository \
       --jq '.[] | "\(.repository.nameWithOwner)\t\(.number)\t\(.url)\t\(.title)"' 2>/dev/null || true)"
     [ -n "$arows" ] || continue
@@ -379,6 +411,7 @@ EOF
 
   listing="$(printf '%s' "$rows" | sed '/^$/d' \
     | sort -t "$(printf '\t')" -k1,1 -k2,2n \
+    | { if [ -n "$limit" ]; then head -n "$limit"; else cat; fi; } \
     | while IFS=$'\t' read -r repo num url title acct; do
         line="$url"
         [ "$notitle" = 1 ] || line="$url -- $title"
@@ -1039,10 +1072,27 @@ fi
 # ══════════════════════════════════════════════════════════════════════════
 if [ "$subcmd" != "merge" ] && [ -z "$id" ]; then
   rows=""
-  if [ "${#merge_ids[@]}" -eq 0 ]; then
+  if [ "$latest" = 1 ]; then
+    # GitHub can't sort by merge time, but merging updates a PR, so the most
+    # recently updated merged PRs hold the most recently merged ones. Fetch
+    # twice the count by update time and order by mergedAt here. Rows carry a
+    # 5th field, the merge date, and arrive already in order.
+    want="${limit:-10}"
+    fetch=$((want * 2)); [ "$fetch" -lt 20 ] && fetch=20
     gh_err=$(mktemp)
     rc=0
-    rows="$(gh pr list --author "@me" --state open --limit 100 --json number,url,title \
+    rows="$(gh pr list --author "@me" --state merged --search "sort:updated-desc" --limit "$fetch" \
+      --json number,url,title,mergedAt \
+      --jq 'sort_by(.mergedAt) | reverse | .[] | "\(.number)\t\(.url)\t\(.title)\t\t\(.mergedAt[:10])"' 2>"$gh_err")" || rc=$?
+    err="$(cat "$gh_err")"; rm -f "$gh_err"
+    if [ "$rc" -ne 0 ]; then
+      echo "gp pr: couldn't list PRs — ${err:-gh pr list failed (exit $rc)}" >&2
+      exit 1
+    fi
+  elif [ "${#merge_ids[@]}" -eq 0 ]; then
+    gh_err=$(mktemp)
+    rc=0
+    rows="$(gh pr list --author "@me" --state open --limit "${limit:-100}" --json number,url,title \
       --jq '.[] | "\(.number)\t\(.url)\t\(.title)"' 2>"$gh_err")" || rc=$?
     err="$(cat "$gh_err")"; rm -f "$gh_err"
     if [ "$rc" -ne 0 ]; then
@@ -1076,15 +1126,28 @@ EOF
     rows="$filtered"
   fi
 
-  listing="$(printf '%s\n' "$rows" | sed '/^$/d' | sort -t "$(printf '\t')" -k1,1n -u \
-    | while IFS=$'\t' read -r num url title state; do
-        line="$url"
-        [ "$notitle" = 1 ] || line="$url -- $title"
-        [ -n "${state:-}" ] && [ "$state" != "OPEN" ] && line="$line [$state]"
-        echo "$line"
-      done)"
+  if [ "$latest" = 1 ]; then
+    # Already newest-merged first; cut to the count only now, after -x.
+    rows="$(printf '%s\n' "$rows" | sed '/^$/d' | head -n "$want")"
+  else
+    rows="$(printf '%s\n' "$rows" | sed '/^$/d' | sort -t "$(printf '\t')" -k1,1n -u)"
+  fi
+  # awk, not `read`: read collapses runs of tabs, which would shift a
+  # `latest` row's date (after its empty state field) into the state.
+  listing="$(printf '%s\n' "$rows" | sed '/^$/d' \
+    | awk -F '\t' -v nt="$notitle" -v dim="$_dim" -v off="$_off" '{
+        line = $2
+        if (nt != 1) line = line " -- " $3
+        if ($4 != "" && $4 != "OPEN") line = line " [" $4 "]"
+        if (nt != 1 && $5 != "") line = line " " dim "(merged " $5 ")" off
+        print line
+      }')"
   if [ -n "$listing" ]; then
     printf '%s\n' "$listing"
+  elif [ "$latest" = 1 ]; then
+    printf 'no merged PRs in %s authored by %s\n' \
+      "$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || echo '?')" \
+      "$(gh api user --jq .login 2>/dev/null || echo '?')"
   elif [ "${#merge_ids[@]}" -eq 0 ]; then
     # Genuinely zero PRs is a normal, valid state — but silence here reads
     # identically whether that's true or the wrong `gh` account is active
