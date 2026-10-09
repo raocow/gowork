@@ -158,7 +158,13 @@ gp pr — list your open PRs, check one out, or merge one or more.
   gp pr -c                   also copy the listing to the clipboard (--copy;
                               works with any listing form, not merge)
   gp pr latest               your most recently merged PRs in this repo,
-                              newest first (10; -N for N: latest -50)
+                              newest first, with local merge time (10; -N for N)
+  gp pr latest <when>        everything you merged since <when>: 10/5,
+                              '10/5 2:30pm', 2pm, 2026-10-05, yesterday, 3d;
+                              <from>..<to> for a window (-N still caps it).
+                              Times are American; GOWORK_TIME_FORMAT or
+                              git config --global gowork.timeFormat sets
+                              us (default), eu, or iso
   gp pr -N                   list at most N (-20); works with any listing
                               of your PRs: gp pr, latest, -g
   gp pr -g                   every open PR under EVERY gh account you're
@@ -232,6 +238,9 @@ all=0
 dry=0
 method=""
 latest=0         # list recently merged PRs instead of open ones (`latest`, `pll`)
+when=""          # `latest`'s date/time argument, as typed
+fmt=""           # us | eu | iso, from _time_format
+merged_q=""      # ...and as a GitHub merged: qualifier
 limit=""         # -N: how many to list ("" = each listing's default)
 raw_targets=()   # positional args before -x: ids and/or "NNN-MMM" ranges
 raw_methods=()   # parallel to raw_targets: that id's merge method ("" = default)
@@ -253,6 +262,114 @@ _claim_pending() {  # _claim_pending <method>
     i=$((i + 1))
   done
   method_flagged=1
+}
+
+# --- dates for `latest` --------------------------------------------------
+# `gp pr latest <when>` lists what merged since <when>, and `<a>..<b>` what
+# merged between the two. A point is a local date, a time, or both:
+#   dates  10/5  10/5/2026  10/5/26  2026-10-05  today  yesterday
+#   times  2:30pm  2pm  14:30          (a time alone means today)
+#   ago    45m  12h  3d  2w
+# As the end of a window, a bare day runs to its last second. Each point
+# becomes an ISO 8601 time with the local offset, which GitHub's merged:
+# qualifier takes as-is, so the filtering happens on GitHub's side. Both BSD
+# date (macOS) and GNU date are handled.
+#
+# Times are American unless GOWORK_TIME_FORMAT (or `git config --global
+# gowork.timeFormat`) says otherwise. It sets how merge times are shown and
+# which way round a slashed date reads:
+#   us   Oct 8, 2026, 5:05 PM    10/5 is October 5   (the default)
+#   eu   8 Oct 2026, 17:05       10/5 is 10 May
+#   iso  2026-10-08 17:05        10/5 is October 5
+_time_format() {
+  local f="${GOWORK_TIME_FORMAT:-}"
+  [ -n "$f" ] || f="$(git config --get gowork.timeFormat 2>/dev/null || true)"
+  f="$(printf '%s' "${f:-us}" | tr '[:upper:]' '[:lower:]')"
+  case "$f" in
+    us|eu|iso) echo "$f" ;;
+    *) echo "gp pr: time format '$f' isn't one of us, eu, iso (from GOWORK_TIME_FORMAT or gowork.timeFormat)" >&2; exit 2 ;;
+  esac
+}
+_epoch_local() {  # _epoch_local <epoch> -> "YYYY-MM-DD HH:MM"
+  date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || date -d "@$1" '+%Y-%m-%d %H:%M'
+}
+_local_iso() {  # _local_iso "YYYY-MM-DD HH:MM" [SS] -> ISO 8601 with offset, or fail
+  local out back sec="${2:-00}"
+  out="$(date -j -f '%Y-%m-%d %H:%M' "$1" "+%Y-%m-%dT%H:%M:$sec%z" 2>/dev/null)" \
+    || out="$(date -d "$1" "+%Y-%m-%dT%H:%M:$sec%z" 2>/dev/null)" || return 1
+  # BSD date rolls 2026-02-31 over to March instead of failing; a time that
+  # doesn't read back the same was never a real one.
+  back="$(printf '%s' "$out" | cut -c1-16 | tr T ' ')"
+  [ "$back" = "$1" ] || return 1
+  printf '%s:%s\n' "${out%??}" "${out#"${out%??}"}"
+}
+_pad2() { [ "${#1}" = 1 ] && echo "0$1" || echo "$1"; }
+_day_of() {  # _day_of <date word> -> YYYY-MM-DD, or fail
+  local d="$1" a b y
+  case "$d" in
+    today) date '+%Y-%m-%d' ;;
+    yesterday) _epoch_local $(( $(date +%s) - 86400 )) | cut -c1-10 ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) echo "$d" ;;
+    */*)
+      a="${d%%/*}"; b="${d#*/}"; y=""
+      case "$b" in */*) y="${b#*/}"; b="${b%%/*}" ;; esac
+      case "$a$b$y" in ''|*[!0-9]*) return 1 ;; esac
+      [ "${#a}" -le 2 ] && [ "${#b}" -le 2 ] || return 1
+      case "${#y}" in 0) y="$(date +%Y)" ;; 2) y="20$y" ;; 4) ;; *) return 1 ;; esac
+      # eu reads day first; us and iso read month first.
+      if [ "$fmt" = eu ]; then echo "$y-$(_pad2 "$b")-$(_pad2 "$a")"
+      else echo "$y-$(_pad2 "$a")-$(_pad2 "$b")"; fi ;;
+    *) return 1 ;;
+  esac
+}
+_clock_of() {  # _clock_of <time word> -> HH:MM, or fail
+  local t h m ap=""
+  t="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$t" in *am|*pm) ap="${t#"${t%??}"}"; t="${t%??}" ;; esac
+  case "$t" in
+    *:*) h="${t%%:*}"; m="${t#*:}" ;;
+    *) [ -n "$ap" ] || return 1; h="$t"; m=00 ;;
+  esac
+  case "$h$m" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#h}" -le 2 ] && [ "${#m}" = 2 ] || return 1
+  h=$((10#$h)); [ "$((10#$m))" -le 59 ] || return 1
+  if [ -n "$ap" ]; then
+    [ "$h" -ge 1 ] && [ "$h" -le 12 ] || return 1
+    [ "$h" = 12 ] && h=0
+    [ "$ap" = pm ] && h=$((h + 12))
+  fi
+  [ "$h" -le 23 ] || return 1
+  echo "$(_pad2 "$h"):$m"
+}
+_when_iso() {  # _when_iso <point> [end] -> ISO 8601, or fail
+  local w="$1" n d t day=00:00 sec=00
+  [ "${2:-}" = end ] && { day=23:59; sec=59; }
+  case "$w" in
+    [0-9]*[mhdw])
+      n="${w%?}"
+      case "$n" in *[!0-9]*) ;; *)
+        case "$w" in
+          *m) n=$((n * 60)) ;; *h) n=$((n * 3600)) ;;
+          *d) n=$((n * 86400)) ;; *w) n=$((n * 604800)) ;;
+        esac
+        _local_iso "$(_epoch_local $(( $(date +%s) - n )))"; return ;;
+      esac ;;
+  esac
+  # A date, a time, or a date then a time ("10/5 2:30pm", "2026-10-05T14:30").
+  w="$(printf '%s' "$w" | sed 's/^\([0-9-]\{10\}\)T/\1 /')"
+  case "$w" in
+    *" "*) d="${w%% *}"; t="${w#* }" ;;
+    *) if d="$(_day_of "$w")"; then t=""; d="$w"; else d=""; t="$w"; fi ;;
+  esac
+  if [ -n "$d" ]; then d="$(_day_of "$d")" || return 1; else d="$(date '+%Y-%m-%d')"; fi
+  if [ -n "$t" ]; then t="$(_clock_of "$t")" || return 1; _local_iso "$d $t"
+  else _local_iso "$d $day" "$sec"; fi
+}
+_when_bad() {
+  local eg="10/5, '10/5 2:30pm', 2:30pm"
+  [ "$fmt" = eu ] && eg="5/10, '5/10 14:30', 14:30"
+  echo "gp pr latest: '$1' isn't a date or time — try $eg, 2026-10-05, yesterday, 3d, or <from>..<to>" >&2
+  exit 2
 }
 
 # `merge`/`list`/`close` are subcommands, not flags: `gp pr merge <ids...>` /
@@ -351,8 +468,24 @@ else
   if [ "$all" = 1 ] && [ "${#raw_targets[@]}" -gt 0 ]; then
     echo "gp pr: can't combine --all with specific PRs" >&2; exit 2
   fi
+  # `latest` takes no ids; its arguments are a date, a time, or a range.
+  # A date and a time given as two words ('2026-10-05 14:30' unquoted) are
+  # joined back into one.
   if [ "$latest" = 1 ] && [ "${#raw_targets[@]}" -gt 0 ]; then
-    echo "gp pr latest: takes no ids — it lists your recently merged PRs (-N for how many, -x to leave some out)" >&2; exit 2
+    fmt="$(_time_format)" || exit 2
+    when="${raw_targets[*]}"
+    raw_targets=(); raw_methods=()
+    case "$when" in
+      *..*) w_from="${when%%..*}"; w_to="${when#*..}" ;;
+      *)    w_from="$when"; w_to="" ;;
+    esac
+    [ -n "$w_from$w_to" ] || _when_bad "$when"
+    merged_q=""
+    if [ -n "$w_from" ]; then from_iso="$(_when_iso "$w_from")" || _when_bad "$w_from"; fi
+    if [ -n "$w_to" ]; then to_iso="$(_when_iso "$w_to" end)" || _when_bad "$w_to"; fi
+    if [ -n "$w_from" ] && [ -n "$w_to" ]; then merged_q="merged:$from_iso..$to_iso"
+    elif [ -n "$w_from" ]; then merged_q="merged:>=$from_iso"
+    else merged_q="merged:<=$to_iso"; fi
   fi
   if [ -n "$limit" ] && [ "${#raw_targets[@]}" -gt 0 ]; then
     echo "gp pr: -$limit limits a listing of your PRs; it doesn't apply to named ids" >&2; exit 2
@@ -1076,14 +1209,22 @@ if [ "$subcmd" != "merge" ] && [ -z "$id" ]; then
     # GitHub can't sort by merge time, but merging updates a PR, so the most
     # recently updated merged PRs hold the most recently merged ones. Fetch
     # twice the count by update time and order by mergedAt here. Rows carry a
-    # 5th field, the merge date, and arrive already in order.
-    want="${limit:-10}"
-    fetch=$((want * 2)); [ "$fetch" -lt 20 ] && fetch=20
+    # 5th field, the merge time in local time, and arrive already in order.
+    # With a date, GitHub does the filtering and everything in the window is
+    # shown unless -N caps it; gh's own ceiling is 1000.
+    if [ -n "$merged_q" ]; then want="${limit:-1000}"; else want="${limit:-10}"; fi
+    [ -n "$fmt" ] || { fmt="$(_time_format)" || exit 2; }
+    case "$fmt" in
+      us)  tfmt="%b %-d, %Y, %-I:%M %p" ;;
+      eu)  tfmt="%-d %b %Y, %H:%M" ;;
+      iso) tfmt="%Y-%m-%d %H:%M" ;;
+    esac
+    fetch=$((want * 2)); [ "$fetch" -lt 20 ] && fetch=20; [ "$fetch" -gt 1000 ] && fetch=1000
     gh_err=$(mktemp)
     rc=0
-    rows="$(gh pr list --author "@me" --state merged --search "sort:updated-desc" --limit "$fetch" \
+    rows="$(gh pr list --author "@me" --state merged --search "${merged_q:+$merged_q }sort:updated-desc" --limit "$fetch" \
       --json number,url,title,mergedAt \
-      --jq 'sort_by(.mergedAt) | reverse | .[] | "\(.number)\t\(.url)\t\(.title)\t\t\(.mergedAt[:10])"' 2>"$gh_err")" || rc=$?
+      --jq 'sort_by(.mergedAt) | reverse | .[] | "\(.number)\t\(.url)\t\(.title)\t\t\(.mergedAt | fromdateiso8601 | strflocaltime("'"$tfmt"'"))"' 2>"$gh_err")" || rc=$?
     err="$(cat "$gh_err")"; rm -f "$gh_err"
     if [ "$rc" -ne 0 ]; then
       echo "gp pr: couldn't list PRs — ${err:-gh pr list failed (exit $rc)}" >&2
@@ -1145,7 +1286,7 @@ EOF
   if [ -n "$listing" ]; then
     printf '%s\n' "$listing"
   elif [ "$latest" = 1 ]; then
-    printf 'no merged PRs in %s authored by %s\n' \
+    printf 'no merged PRs%s in %s authored by %s\n' "${when:+ for '$when'}" \
       "$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || echo '?')" \
       "$(gh api user --jq .login 2>/dev/null || echo '?')"
   elif [ "${#merge_ids[@]}" -eq 0 ]; then

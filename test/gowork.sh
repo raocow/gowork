@@ -116,21 +116,29 @@ while [ \$# -gt 0 ]; do
   shift
 done
 if [ "\$state" = merged ]; then
-  printf '%s' '[{"number":9,"url":"u/9","title":"nine","mergedAt":"2026-10-03T00:00:00Z"},
-               {"number":8,"url":"u/8","title":"eight","mergedAt":"2026-10-02T00:00:00Z"},
-               {"number":7,"url":"u/7","title":"seven","mergedAt":"2026-10-05T00:00:00Z"}]'
+  printf '%s' '[{"number":9,"url":"u/9","title":"nine","mergedAt":"2026-10-03T20:15:00Z"},
+               {"number":8,"url":"u/8","title":"eight","mergedAt":"2026-10-02T18:00:00Z"},
+               {"number":7,"url":"u/7","title":"seven","mergedAt":"2026-10-06T02:30:00Z"}]'
 else
   printf '%s' '[{"number":12,"url":"u/12","title":"twelve"},{"number":11,"url":"u/11","title":"eleven"}]'
 fi | jq -r "\$jq_expr"
 EOF2
 chmod +x "$FAKE/gh"
 PRREPO="$TMP/prrepo"; git init -q "$PRREPO"
-pl() { (cd "$PRREPO" && PATH="$FAKE:$PATH" "$GW" "$@" 2>&1); }
+pl() { (cd "$PRREPO" && TZ=America/Los_Angeles PATH="$FAKE:$PATH" "$GW" "$@" 2>&1); }
 out="$(pl pll)"
-check "pll lists merged PRs, newest merge first" "$out" "u/7 -- seven (merged 2026-10-05)
-u/9 -- nine (merged 2026-10-03)
-u/8 -- eight (merged 2026-10-02)"
-check "pl latest is the same" "$(pl pl latest)" "$out"
+# #7 merged 02:30 UTC on the 6th, which is the evening of the 5th in
+# California: the time shown is local, and so is the day.
+check "pll lists merged PRs, newest merge first, in local American time" "$out" "u/7 -- seven (merged Oct 5, 2026, 7:30 PM)
+u/9 -- nine (merged Oct 3, 2026, 1:15 PM)
+u/8 -- eight (merged Oct 2, 2026, 11:00 AM)"
+check "GOWORK_TIME_FORMAT=eu shows day first, 24-hour" "$(GOWORK_TIME_FORMAT=eu pl pll -1)" "u/7 -- seven (merged 5 Oct 2026, 19:30)"
+git config --global gowork.timeFormat iso
+check "gowork.timeFormat=iso shows ISO" "$(pl pll -1)" "u/7 -- seven (merged 2026-10-05 19:30)"
+git config --global --unset gowork.timeFormat
+out="$(GOWORK_TIME_FORMAT=uk pl pll)"; rc=$?
+check "an unknown time format is refused" "$rc" "2"
+check "pl latest is the same" "$(pl pl latest)" "$(pl pll)"
 check "pll -2 shows two" "$(pl pll -2 -nt)" "u/7
 u/9"
 check "pll -x drops a PR before counting" "$(pl pll -2 -nt -x 7)" "u/9
@@ -141,8 +149,38 @@ rm -f "$TMP/gh-calls"; out="$(pl pl -5)"
 check "pl still lists open PRs" "$out" "u/11 -- eleven
 u/12 -- twelve"
 saw "pl -5 limits the open listing" "$(cat "$TMP/gh-calls")" "--state open --limit 5"
+# A date argument becomes GitHub's merged: qualifier, in local time with its
+# offset, so GitHub does the filtering. With a date there is no default cap.
+rm -f "$TMP/gh-calls"; pl pll 2026-10-05 >/dev/null
+saw "pll <date> asks GitHub for merges since that local midnight" "$(cat "$TMP/gh-calls")" \
+  "--search merged:>=2026-10-05T00:00:00-07:00 sort:updated-desc --limit 1000"
+rm -f "$TMP/gh-calls"; pl pll 2026-10-05 14:30 -5 >/dev/null
+saw "pll <date> <time>, as two words, is one point; -N still caps" "$(cat "$TMP/gh-calls")" \
+  "--search merged:>=2026-10-05T14:30:00-07:00 sort:updated-desc --limit 20"
+rm -f "$TMP/gh-calls"; pl pl latest 2026-10-01..2026-10-05 >/dev/null
+saw "a window's end date runs to the end of that day" "$(cat "$TMP/gh-calls")" \
+  "merged:2026-10-01T00:00:00-07:00..2026-10-05T23:59:59-07:00"
+rm -f "$TMP/gh-calls"; pl pll ..2026-12-01T09:00 >/dev/null
+saw "..<when> means up to then (standard time in December)" "$(cat "$TMP/gh-calls")" \
+  "merged:<=2026-12-01T09:00:00-08:00"
 out="$(pl pll 3)"; rc=$?
 check "pll takes no ids" "$rc" "2"
+saw "...and says what it does take" "$out" "isn't a date or time"
+out="$(pl pll 2026-02-31)"; rc=$?
+check "pll refuses a date that doesn't exist" "$rc" "2"
+rm -f "$TMP/gh-calls"; pl pll 10/5/2026 2:30pm..10/6/26 9am >/dev/null
+saw "American dates and 12-hour times" "$(cat "$TMP/gh-calls")" \
+  "merged:2026-10-05T14:30:00-07:00..2026-10-06T09:00:00-07:00"
+rm -f "$TMP/gh-calls"; GOWORK_TIME_FORMAT=eu pl pll 5/10/2026..6/10/2026 >/dev/null
+saw "eu reads a slashed date day first" "$(cat "$TMP/gh-calls")" \
+  "merged:2026-10-05T00:00:00-07:00..2026-10-06T23:59:59-07:00"
+rm -f "$TMP/gh-calls"; pl pll 12am..12pm >/dev/null
+saw "12am is midnight..." "$(cat "$TMP/gh-calls")" "T00:00:00-0"
+saw "...and 12pm is noon" "$(cat "$TMP/gh-calls")" "T12:00:00-0"
+for bad in 13/5 13pm 0am 9:60 10/5/123; do
+  out="$(pl pll "$bad")"; rc=$?
+  check "pll refuses '$bad'" "$rc" "2"
+done
 out="$(pl pm 3 -5)"; rc=$?
 check "a count doesn't apply to merge" "$rc" "2"
 out="$(pl pll -0)"; rc=$?
