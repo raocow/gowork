@@ -153,12 +153,13 @@ usage() {
   cat <<'EOF'
 gp pr — list your open PRs, check one out, or merge one or more.
 
-  gp pr                      list your open PRs in this repo, as "<url> -- <title>"
+  gp pr                      list your open PRs in this repo, as "<url> -- <title>",
+                              each with when it was opened, in local time
   gp pr -nt                  list them as bare URLs (--no-title)
   gp pr -c                   also copy the listing to the clipboard (--copy;
                               works with any listing form, not merge)
   gp pr latest               your most recently merged or closed PRs in
-                              this repo, newest first, tagged [MERGED] or
+                              this repo, oldest first, tagged [MERGED] or
                               [CLOSED], with local time (10; -N for N)
   gp pr latest <when>        everything you merged or closed since <when>: 10/5,
                               '10/5 2:30pm', 2pm, 2026-10-05, yesterday, 3d;
@@ -289,6 +290,14 @@ _time_format() {
   case "$f" in
     us|eu|iso) echo "$f" ;;
     *) echo "gp pr: time format '$f' isn't one of us, eu, iso (from GOWORK_TIME_FORMAT or gowork.timeFormat)" >&2; exit 2 ;;
+  esac
+}
+_set_tfmt() {  # sets fmt and tfmt, the strflocaltime pattern listings use
+  [ -n "$fmt" ] || { fmt="$(_time_format)" || exit 2; }
+  case "$fmt" in
+    us)  tfmt="%b %-d, %Y, %-I:%M %p" ;;
+    eu)  tfmt="%-d %b %Y, %H:%M" ;;
+    iso) tfmt="%Y-%m-%d %H:%M" ;;
   esac
 }
 _epoch_local() {  # _epoch_local <epoch> -> "YYYY-MM-DD HH:MM"
@@ -525,13 +534,14 @@ if [ "$global" = 1 ]; then
   if [ -z "$accounts" ]; then
     echo "gp pr: no accounts logged in to gh (try: gh auth login)" >&2; exit 1
   fi
+  _set_tfmt
   rows=""
   for acct in $accounts; do
     atok="$(gh auth token --user "$acct" 2>/dev/null || true)"
     [ -n "$atok" ] || continue
     arows="$(GH_TOKEN="$atok" gh search prs --author "@me" --state open --limit "${limit:-100}" \
-      --json number,url,title,repository \
-      --jq '.[] | "\(.repository.nameWithOwner)\t\(.number)\t\(.url)\t\(.title)"' 2>/dev/null || true)"
+      --json number,url,title,repository,createdAt \
+      --jq '.[] | "\(.repository.nameWithOwner)\t\(.number)\t\(.url)\t\(.title)\t\(.createdAt | fromdateiso8601 | strflocaltime("'"$tfmt"'"))"' 2>/dev/null || true)"
     [ -n "$arows" ] || continue
     # Tag each row with the account it came from, so a mixed list says which
     # identity owns what — the whole point of looking across accounts.
@@ -546,10 +556,10 @@ EOF
   listing="$(printf '%s' "$rows" | sed '/^$/d' \
     | sort -t "$(printf '\t')" -k1,1 -k2,2n \
     | { if [ -n "$limit" ]; then head -n "$limit"; else cat; fi; } \
-    | while IFS=$'\t' read -r repo num url title acct; do
+    | while IFS=$'\t' read -r repo num url title opened acct; do
         line="$url"
         [ "$notitle" = 1 ] || line="$url -- $title"
-        [ "$notitle" = 1 ] || line="$line ${_dim}($acct)${_off}"
+        [ "$notitle" = 1 ] || line="$line ${_dim}(opened $opened, $acct)${_off}"
         echo "$line"
       done)"
 
@@ -1206,6 +1216,10 @@ fi
 # ══════════════════════════════════════════════════════════════════════════
 if [ "$subcmd" != "merge" ] && [ -z "$id" ]; then
   rows=""
+  # Every row's 5th field is a local time: when an open PR was opened, or
+  # when a finished one merged or closed.
+  _set_tfmt
+  when_jq='(if .state == null or .state == "OPEN" then .createdAt else .closedAt end | fromdateiso8601 | strflocaltime("'"$tfmt"'"))'
   if [ "$latest" = 1 ]; then
     # Finished PRs: merged and closed. --state closed covers both, and a
     # merged PR's closedAt is its merge time. GitHub can't sort by close
@@ -1213,22 +1227,17 @@ if [ "$subcmd" != "merge" ] && [ -z "$id" ]; then
     # hold the most recently closed ones. Fetch twice the count by update
     # time and order by closedAt here. Rows carry the state (MERGED or
     # CLOSED), as `gp pl <ids>` rows do, and a 5th field, the close time in
-    # local time, and arrive already in order.
+    # local time, and arrive newest first, so -N keeps the latest; they're
+    # shown oldest first once cut.
     # With a date, GitHub does the filtering and everything in the window is
     # shown unless -N caps it; gh's own ceiling is 1000.
     if [ -n "$merged_q" ]; then want="${limit:-1000}"; else want="${limit:-10}"; fi
-    [ -n "$fmt" ] || { fmt="$(_time_format)" || exit 2; }
-    case "$fmt" in
-      us)  tfmt="%b %-d, %Y, %-I:%M %p" ;;
-      eu)  tfmt="%-d %b %Y, %H:%M" ;;
-      iso) tfmt="%Y-%m-%d %H:%M" ;;
-    esac
     fetch=$((want * 2)); [ "$fetch" -lt 20 ] && fetch=20; [ "$fetch" -gt 1000 ] && fetch=1000
     gh_err=$(mktemp)
     rc=0
     rows="$(gh pr list --author "@me" --state closed --search "${merged_q:+$merged_q }sort:updated-desc" --limit "$fetch" \
       --json number,url,title,state,closedAt \
-      --jq 'sort_by(.closedAt) | reverse | .[] | "\(.number)\t\(.url)\t\(.title)\t\(.state)\t\(.closedAt | fromdateiso8601 | strflocaltime("'"$tfmt"'"))"' 2>"$gh_err")" || rc=$?
+      --jq 'sort_by(.closedAt) | reverse | .[] | "\(.number)\t\(.url)\t\(.title)\t\(.state)\t\('"$when_jq"')"' 2>"$gh_err")" || rc=$?
     err="$(cat "$gh_err")"; rm -f "$gh_err"
     if [ "$rc" -ne 0 ]; then
       echo "gp pr: couldn't list PRs — ${err:-gh pr list failed (exit $rc)}" >&2
@@ -1237,8 +1246,8 @@ if [ "$subcmd" != "merge" ] && [ -z "$id" ]; then
   elif [ "${#merge_ids[@]}" -eq 0 ]; then
     gh_err=$(mktemp)
     rc=0
-    rows="$(gh pr list --author "@me" --state open --limit "${limit:-100}" --json number,url,title \
-      --jq '.[] | "\(.number)\t\(.url)\t\(.title)"' 2>"$gh_err")" || rc=$?
+    rows="$(gh pr list --author "@me" --state open --limit "${limit:-100}" --json number,url,title,createdAt \
+      --jq '.[] | "\(.number)\t\(.url)\t\(.title)\t\t\('"$when_jq"')"' 2>"$gh_err")" || rc=$?
     err="$(cat "$gh_err")"; rm -f "$gh_err"
     if [ "$rc" -ne 0 ]; then
       echo "gp pr: couldn't list PRs — ${err:-gh pr list failed (exit $rc)}" >&2
@@ -1246,8 +1255,8 @@ if [ "$subcmd" != "merge" ] && [ -z "$id" ]; then
     fi
   else
     for tid in ${merge_ids[@]+"${merge_ids[@]}"}; do
-      row="$(gh pr view "$tid" --json number,url,title,state \
-        --jq '"\(.number)\t\(.url)\t\(.title)\t\(.state)"' 2>/dev/null || true)"
+      row="$(gh pr view "$tid" --json number,url,title,state,createdAt,closedAt \
+        --jq '"\(.number)\t\(.url)\t\(.title)\t\(.state)\t\('"$when_jq"')"' 2>/dev/null || true)"
       [ -n "$row" ] && rows="$rows
 $row"
     done
@@ -1272,19 +1281,20 @@ EOF
   fi
 
   if [ "$latest" = 1 ]; then
-    # Already newest-closed first; cut to the count only now, after -x.
-    rows="$(printf '%s\n' "$rows" | sed '/^$/d' | head -n "$want")"
+    # Newest first until cut to the count, only now, after -x; then shown
+    # oldest first, so the latest is at the bottom, next to the prompt.
+    rows="$(printf '%s\n' "$rows" | sed '/^$/d' | head -n "$want" | awk '{ l[NR] = $0 } END { for (i = NR; i > 0; i--) print l[i] }')"
   else
     rows="$(printf '%s\n' "$rows" | sed '/^$/d' | sort -t "$(printf '\t')" -k1,1n -u)"
   fi
   # awk, not `read`: read collapses runs of tabs, which would shift a
-  # date into the state field of a row whose state is empty.
+  # time into the state field of a row whose state is empty.
   listing="$(printf '%s\n' "$rows" | sed '/^$/d' \
     | awk -F '\t' -v nt="$notitle" -v dim="$_dim" -v off="$_off" '{
         line = $2
         if (nt != 1) line = line " -- " $3
         if ($4 != "" && $4 != "OPEN") line = line " [" $4 "]"
-        if (nt != 1 && $5 != "") line = line " " dim "(" $5 ")" off
+        if (nt != 1 && $5 != "") line = line " " dim "(" ($4 == "" || $4 == "OPEN" ? "opened " : "") $5 ")" off
         print line
       }')"
   if [ -n "$listing" ]; then

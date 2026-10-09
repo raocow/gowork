@@ -51,7 +51,10 @@ With no number,
 .B gp pr
 lists the open pull requests you have authored in the current repository, one
 per line as
-.IR "<url> -- <title>" .
+.IR "<url> -- <title>" ,
+each followed by when it was opened, in local time. A PR named by ID shows
+when it was opened, or, once merged or closed, its state and when that
+happened.
 With
 .B \-\-no\-title
 it prints just the URLs, one per line, for easy piping. Listing uses
@@ -63,7 +66,7 @@ it prints just the URLs, one per line, for easy piping. Listing uses
 or the shorthand
 .BR "gp pll" )
 lists the pull requests you authored that have merged or been closed in the
-current repository, most recent first, each tagged
+current repository, oldest first so the latest is at the bottom, each tagged
 .B [MERGED]
 or
 .B [CLOSED]

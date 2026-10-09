@@ -121,7 +121,8 @@ if [ "\$state" = closed ]; then
                {"number":10,"url":"u/10","title":"ten","state":"CLOSED","closedAt":"2026-10-01T16:00:00Z"},
                {"number":7,"url":"u/7","title":"seven","state":"MERGED","closedAt":"2026-10-06T02:30:00Z"}]'
 else
-  printf '%s' '[{"number":12,"url":"u/12","title":"twelve"},{"number":11,"url":"u/11","title":"eleven"}]'
+  printf '%s' '[{"number":12,"url":"u/12","title":"twelve","createdAt":"2026-10-07T16:05:00Z"},
+               {"number":11,"url":"u/11","title":"eleven","createdAt":"2026-10-06T23:40:00Z"}]'
 fi | jq -r "\$jq_expr"
 EOF2
 chmod +x "$FAKE/gh"
@@ -130,10 +131,10 @@ pl() { (cd "$PRREPO" && TZ=America/Los_Angeles PATH="$FAKE:$PATH" "$GW" "$@" 2>&
 out="$(pl pll)"
 # #7 merged 02:30 UTC on the 6th, which is the evening of the 5th in
 # California: the time shown is local, and so is the day.
-check "pll lists merged and closed PRs, newest first, tagged, in local American time" "$out" "u/7 -- seven [MERGED] (Oct 5, 2026, 7:30 PM)
-u/9 -- nine [MERGED] (Oct 3, 2026, 1:15 PM)
+check "pll lists merged and closed PRs, oldest first, tagged, in local American time" "$out" "u/10 -- ten [CLOSED] (Oct 1, 2026, 9:00 AM)
 u/8 -- eight [MERGED] (Oct 2, 2026, 11:00 AM)
-u/10 -- ten [CLOSED] (Oct 1, 2026, 9:00 AM)"
+u/9 -- nine [MERGED] (Oct 3, 2026, 1:15 PM)
+u/7 -- seven [MERGED] (Oct 5, 2026, 7:30 PM)"
 check "GOWORK_TIME_FORMAT=eu shows day first, 24-hour" "$(GOWORK_TIME_FORMAT=eu pl pll -1)" "u/7 -- seven [MERGED] (5 Oct 2026, 19:30)"
 git config --global gowork.timeFormat iso
 check "gowork.timeFormat=iso shows ISO" "$(pl pll -1)" "u/7 -- seven [MERGED] (2026-10-05 19:30)"
@@ -141,15 +142,17 @@ git config --global --unset gowork.timeFormat
 out="$(GOWORK_TIME_FORMAT=uk pl pll)"; rc=$?
 check "an unknown time format is refused" "$rc" "2"
 check "pl latest is the same" "$(pl pl latest)" "$(pl pll)"
-check "pll -2 shows two" "$(pl pll -2 -nt)" "u/7 [MERGED]
+check "pll -2 shows the latest two, oldest first" "$(pl pll -2 -nt)" "u/9 [MERGED]
+u/7 [MERGED]"
+check "pll -x drops a PR before counting" "$(pl pll -2 -nt -x 7)" "u/8 [MERGED]
 u/9 [MERGED]"
-check "pll -x drops a PR before counting" "$(pl pll -2 -nt -x 7)" "u/9 [MERGED]
-u/8 [MERGED]"
 rm -f "$TMP/gh-calls"; pl pll -30 >/dev/null
 saw "pll asks for closed PRs (merged ones included) by update time" "$(cat "$TMP/gh-calls")" "--state closed --search sort:updated-desc --limit 60"
 rm -f "$TMP/gh-calls"; out="$(pl pl -5)"
-check "pl still lists open PRs" "$out" "u/11 -- eleven
-u/12 -- twelve"
+check "pl lists open PRs with when each was opened, in local time" "$out" "u/11 -- eleven (opened Oct 6, 2026, 4:40 PM)
+u/12 -- twelve (opened Oct 7, 2026, 9:05 AM)"
+check "pl -nt is bare URLs" "$(pl pl -nt)" "u/11
+u/12"
 saw "pl -5 limits the open listing" "$(cat "$TMP/gh-calls")" "--state open --limit 5"
 # A date argument becomes GitHub's closed: qualifier, in local time with its
 # offset, so GitHub does the filtering. With a date there is no default cap.
