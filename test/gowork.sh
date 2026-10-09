@@ -108,6 +108,7 @@ echo "== pr latest =="
 cat > "$FAKE/gh" <<EOF2
 #!/usr/bin/env bash
 echo "gh \$*" >> "$TMP/gh-calls"
+args="\$*"
 [ "\$1 \$2" = "pr view" ] && { echo "\$3"; exit 0; }
 [ "\$1 \$2" = "pr list" ] || exit 0
 jq_expr=""; state=""
@@ -116,10 +117,13 @@ while [ \$# -gt 0 ]; do
   shift
 done
 if [ "\$state" = closed ]; then
-  printf '%s' '[{"number":9,"url":"u/9","title":"nine","state":"MERGED","closedAt":"2026-10-03T20:15:00Z"},
-               {"number":8,"url":"u/8","title":"eight","state":"MERGED","closedAt":"2026-10-02T18:00:00Z"},
-               {"number":10,"url":"u/10","title":"ten","state":"CLOSED","closedAt":"2026-10-01T16:00:00Z"},
-               {"number":7,"url":"u/7","title":"seven","state":"MERGED","closedAt":"2026-10-06T02:30:00Z"}]'
+  # -f's checks ask for 50; by then #13 has merged.
+  extra=""
+  case "\$args" in *"--limit 50"*) extra=',{"number":13,"url":"u/13","title":"thirteen","state":"MERGED","closedAt":"2026-10-08T17:00:00Z","author":{"login":"me"}}' ;; esac
+  printf '%s' '[{"number":9,"url":"u/9","title":"nine","state":"MERGED","closedAt":"2026-10-03T20:15:00Z","author":{"login":"me"}},
+               {"number":8,"url":"u/8","title":"eight","state":"MERGED","closedAt":"2026-10-02T18:00:00Z","author":{"login":"me"}},
+               {"number":10,"url":"u/10","title":"ten","state":"CLOSED","closedAt":"2026-10-01T16:00:00Z","author":{"login":"me"}},
+               {"number":7,"url":"u/7","title":"seven","state":"MERGED","closedAt":"2026-10-06T02:30:00Z","author":{"login":"ana"}}'"\$extra]"
 else
   printf '%s' '[{"number":12,"url":"u/12","title":"twelve","createdAt":"2026-10-07T16:05:00Z"},
                {"number":11,"url":"u/11","title":"eleven","createdAt":"2026-10-06T23:40:00Z"}]'
@@ -148,6 +152,30 @@ check "pll -x drops a PR before counting" "$(pl pll -2 -nt -x 7)" "u/8 [MERGED]
 u/9 [MERGED]"
 rm -f "$TMP/gh-calls"; pl pll -30 >/dev/null
 saw "pll asks for closed PRs (merged ones included) by update time" "$(cat "$TMP/gh-calls")" "--state closed --search sort:updated-desc --limit 60"
+rm -f "$TMP/gh-calls"; out="$(pl pll -e -2)"
+check "pll -e shows anyone's, with the author" "$out" "u/9 -- nine [MERGED] (Oct 3, 2026, 1:15 PM, by me)
+u/7 -- seven [MERGED] (Oct 5, 2026, 7:30 PM, by ana)"
+check "...because it doesn't ask for yours alone" "$(grep -c -- '--author' "$TMP/gh-calls")" "0"
+out="$(pl pll -g -e)"; rc=$?
+check "pll -g -e is refused" "$rc" "2"
+out="$(pl pl -f)"; rc=$?
+check "-f goes with latest only" "$rc" "2"
+out="$(pl pll -f -c)"; rc=$?
+check "pll -f -c is refused" "$rc" "2"
+out="$(pl pll -f 10/1..10/5)"; rc=$?
+check "pll -f with a window that ends is refused" "$rc" "2"
+# -f: the latest, then each PR that closes afterwards, once, though every
+# check returns it again. exec, so the signal reaches gp-pr itself.
+rm -f "$TMP/gh-calls"
+(cd "$PRREPO" && TZ=America/Los_Angeles PATH="$FAKE:$PATH" GOWORK_FOLLOW_INTERVAL=0.2 \
+  exec "$GW" pll -f -nt -2 >"$TMP/follow.out" 2>"$TMP/follow.err") & fpid=$!
+sleep 2; kill "$fpid" 2>/dev/null; wait "$fpid"; rc=$?
+check "pll -f lists the latest, then each PR as it closes, once" "$(cat "$TMP/follow.out")" "u/9 [MERGED]
+u/7 [MERGED]
+u/13 [MERGED]"
+check "pll -f stops cleanly on a signal" "$rc" "0"
+saw "pll -f says it's watching" "$(cat "$TMP/follow.err")" "watching for PRs that merge or close"
+saw "pll -f asks what closed lately" "$(cat "$TMP/gh-calls")" "--search closed:>="
 rm -f "$TMP/gh-calls"; out="$(pl pl -5)"
 check "pl lists open PRs with when each was opened, in local time" "$out" "u/11 -- eleven (opened Oct 6, 2026, 4:40 PM)
 u/12 -- twelve (opened Oct 7, 2026, 9:05 AM)"

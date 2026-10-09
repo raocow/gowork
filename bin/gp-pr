@@ -167,6 +167,13 @@ gp pr — list your open PRs, check one out, or merge one or more.
                               Times are American; GOWORK_TIME_FORMAT or
                               git config --global gowork.timeFormat sets
                               us (default), eu, or iso
+  gp pr latest -f            then stay open and add each PR as it merges or
+                              closes (--follow; checks every 30s, or
+                              GOWORK_FOLLOW_INTERVAL seconds; Ctrl-C stops)
+  gp pr latest -e            anyone's PRs in this repo, not just yours, with
+                              the author (--everyone)
+  gp pr latest -g            yours across every repo and gh account, with the
+                              account
   gp pr -N                   list at most N (-20); works with any listing
                               of your PRs: gp pr, latest, -g
   gp pr -g                   every open PR under EVERY gh account you're
@@ -244,6 +251,8 @@ when=""          # `latest`'s date/time argument, as typed
 fmt=""           # us | eu | iso, from _time_format
 merged_q=""      # ...and as a GitHub closed: qualifier
 limit=""         # -N: how many to list ("" = each listing's default)
+follow=0         # -f: `latest` stays open and prints each PR as it merges or closes
+everyone=0       # -e: `latest` lists anyone's PRs, not just yours
 raw_targets=()   # positional args before -x: ids and/or "NNN-MMM" ranges
 raw_methods=()   # parallel to raw_targets: that id's merge method ("" = default)
 raw_excludes=()  # positional args after -x/--exclude
@@ -299,6 +308,117 @@ _set_tfmt() {  # sets fmt and tfmt, the strflocaltime pattern listings use
     eu)  tfmt="%-d %b %Y, %H:%M" ;;
     iso) tfmt="%Y-%m-%d %H:%M" ;;
   esac
+}
+# --- `latest`: finished PRs, and -f to follow them -----------------------
+# A row is: number, url, title, state (MERGED or CLOSED), local time, who or
+# where (the author with -e, the account with -g, else empty), and closedAt as
+# GitHub gives it, in UTC, which sorts as text. A merged PR's closedAt is its
+# merge time, so one field orders merged and closed PRs together.
+_tab="$(printf '\t')"
+_fin_rows() {  # _fin_rows <how many> [<closed: qualifier>] -> rows, any order
+  local n="$1" q="${2:-}" row acct tok kind st who="" gh_err out rc=0
+  row='"\(.number)\t\(.url)\t\(.title)\t\(.state)\t\(.closedAt | fromdateiso8601 | strflocaltime("'"$tfmt"'"))\t'
+  if [ "$global" = 1 ]; then
+    # Search results say only open or closed, so merged and unmerged PRs are
+    # asked for separately. Each account uses its own token, as the open -g
+    # listing does, and one that can't answer is skipped rather than fatal.
+    for acct in $accounts; do
+      tok="$(gh auth token --user "$acct" 2>/dev/null || true)"
+      [ -n "$tok" ] || continue
+      for kind in merged unmerged; do
+        if [ "$kind" = merged ]; then st=MERGED; else st=CLOSED; fi
+        GH_TOKEN="$tok" gh search prs "is:$kind" ${q:+"$q"} --author "@me" --state closed \
+          --sort updated --limit "$n" --json number,url,title,closedAt \
+          --jq '.[] | .state = "'"$st"'" | '"$row$acct"'\t\(.closedAt)"' 2>/dev/null || true
+      done
+    done
+    return 0
+  fi
+  # --state closed covers merged PRs too. GitHub can't sort by close time,
+  # but closing updates a PR, so the most recently updated closed PRs hold
+  # the most recently closed ones; callers fetch more than they show.
+  local author=(--author "@me")
+  if [ "$everyone" = 1 ]; then author=(); who='by \(.author.login)'; fi
+  gh_err=$(mktemp)
+  out="$(gh pr list ${author[@]+"${author[@]}"} --state closed --search "${q:+$q }sort:updated-desc" --limit "$n" \
+    --json number,url,title,state,closedAt,author \
+    --jq '.[] | '"$row$who"'\t\(.closedAt)"' 2>"$gh_err")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "gp pr: couldn't list PRs — $(cat "$gh_err" 2>/dev/null || true)" | sed 's/ — $/ — gh pr list failed/' >&2
+    rm -f "$gh_err"; return 1
+  fi
+  rm -f "$gh_err"
+  printf '%s\n' "$out"
+}
+_fin_keep() {  # rows on stdin, minus blank ones and those -x excluded
+  awk -F '\t' -v x=" ${exclude_nums:-} " '$2 != "" && index(x, " " $1 " ") == 0'
+}
+_fin_render() {  # rows on stdin -> "<url> -- <title> [STATE] (time, who)"
+  awk -F '\t' -v nt="$notitle" -v dim="$_dim" -v off="$_off" '{
+    line = $2
+    if (nt != 1) line = line " -- " $3
+    line = line " [" $4 "]"
+    if (nt != 1) line = line " " dim "(" $5 ($6 != "" ? ", " $6 : "") ")" off
+    print line
+  }'
+}
+_latest_run() {  # list the latest finished PRs, follow them with -f; exits
+  local want fetch all rows listing every since new url row seen perr warned=0
+  # With a date, GitHub does the filtering and everything in the window is
+  # shown unless -N caps it; gh's own ceiling is 1000.
+  if [ -n "$merged_q" ]; then want="${limit:-1000}"; else want="${limit:-10}"; fi
+  fetch=$((want * 2)); [ "$fetch" -lt 20 ] && fetch=20; [ "$fetch" -gt 1000 ] && fetch=1000
+  all="$(_fin_rows "$fetch" "$merged_q")" || exit 1
+  # Newest first to cut to the count, after -x; then shown oldest first, so
+  # the latest is at the bottom, next to the prompt.
+  rows="$(printf '%s\n' "$all" | _fin_keep | sort -t "$_tab" -k7,7r | head -n "$want" | sort -t "$_tab" -k7,7)"
+  listing="$(printf '%s\n' "$rows" | _fin_keep | _fin_render)"
+  if [ -n "$listing" ]; then
+    printf '%s\n' "$listing"
+  elif [ "$global" = 1 ]; then
+    printf 'no merged or closed PRs%s under any gh account %s(%s)%s\n' "${when:+ for '$when'}" \
+      "$_dim" "$(printf '%s' "$accounts" | tr '\n' ' ' | sed 's/ $//')" "$_off"
+  else
+    printf 'no merged or closed PRs%s in %s%s\n' "${when:+ for '$when'}" \
+      "$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || echo '?')" \
+      "$([ "$everyone" = 1 ] || printf ' authored by %s' "$(gh api user --jq .login 2>/dev/null || echo '?')")"
+  fi
+  if [ "$copy" = 1 ] && [ -n "$listing" ]; then
+    printf '%s\n' "$listing" | pbcopy
+    printf '%s✓%s %s\n' "$_ok" "$_off" "copied to clipboard" >&2
+  fi
+  [ "$follow" = 1 ] || exit 0
+
+  # -f: ask again every GOWORK_FOLLOW_INTERVAL seconds (30) for what closed
+  # in the last ten minutes, and print what hasn't been seen, oldest first.
+  # The overlap absorbs clock skew and GitHub's search index running behind;
+  # remembering every URL shown keeps it from printing anything twice.
+  every="${GOWORK_FOLLOW_INTERVAL:-30}"
+  seen=" $(printf '%s\n' "$all" | cut -f2 | tr '\n' ' ') "
+  perr="$(mktemp)"; _nap=""
+  # The wait is a background sleep so a stop request lands at once, not at
+  # the end of the interval.
+  trap 'kill "${_nap:-}" 2>/dev/null || true; rm -f "$perr"; exit 0' INT TERM
+  printf '%swatching for PRs that merge or close, every %ss; Ctrl-C to stop%s\n' "$_dim" "$every" "$_off" >&2
+  while :; do
+    since="$(_local_iso "$(_epoch_local $(( $(date +%s) - 600 )))")"
+    sleep "$every" & _nap=$!; wait "$_nap" || true
+    if ! new="$(_fin_rows 50 "closed:>=$since" 2>"$perr")"; then
+      # One notice per outage, not one every interval.
+      [ "$warned" = 1 ] || printf '%s (still watching)\n' "$(cat "$perr")" >&2
+      warned=1; continue
+    fi
+    warned=0
+    while IFS= read -r row; do
+      [ -n "$row" ] || continue
+      url="$(printf '%s' "$row" | cut -f2)"
+      case "$seen" in *" $url "*) continue ;; esac
+      seen="$seen$url "
+      printf '%s\n' "$row" | _fin_render
+    done <<EOF
+$(printf '%s\n' "$new" | _fin_keep | sort -t "$_tab" -k7,7)
+EOF
+  done
 }
 _epoch_local() {  # _epoch_local <epoch> -> "YYYY-MM-DD HH:MM"
   date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || date -d "@$1" '+%Y-%m-%d %H:%M'
@@ -404,6 +524,8 @@ while [ $# -gt 0 ]; do
     -a|--all) all=1; in_exclude=0 ;;
     -n|--dry-run) dry=1; in_exclude=0 ;;
     -x|--exclude) in_exclude=1 ;;
+    -f|--follow) follow=1; in_exclude=0 ;;
+    -e|--everyone) everyone=1; in_exclude=0 ;;
     # -N sets how many to list (`gp pr latest -100`). A number is never a
     # flag otherwise, so `-12` can't be mistaken for anything else.
     -[0-9]*)
@@ -430,11 +552,12 @@ if [ "$global" = 1 ]; then
   if [ "$subcmd" = "merge" ]; then
     echo "gp pr: -g/--global is for listing, not merging — merging across every repo you have access to isn't something a single flag should do" >&2; exit 2
   fi
-  if [ "${#raw_targets[@]}" -gt 0 ] || [ "${#raw_excludes[@]}" -gt 0 ]; then
+  # `latest`'s arguments are a date or time, not ids, so they stay allowed.
+  if { [ "${#raw_targets[@]}" -gt 0 ] && [ "$latest" = 0 ]; } || [ "${#raw_excludes[@]}" -gt 0 ]; then
     echo "gp pr: -g/--global lists everything and takes no ids (or -x)" >&2; exit 2
   fi
-  if [ "$latest" = 1 ]; then
-    echo "gp pr: -g/--global lists open PRs; 'latest' is per repo" >&2; exit 2
+  if [ "$everyone" = 1 ]; then
+    echo "gp pr: -e/--everyone is for one repo; everyone's PRs everywhere is all of GitHub" >&2; exit 2
   fi
 fi
 
@@ -501,6 +624,13 @@ else
     echo "gp pr: -$limit limits a listing of your PRs; it doesn't apply to named ids" >&2; exit 2
   fi
 fi
+if [ "$latest" = 0 ] && { [ "$follow" = 1 ] || [ "$everyone" = 1 ]; }; then
+  echo "gp pr: -f/--follow and -e/--everyone go with 'latest' (gp pll -f)" >&2; exit 2
+fi
+if [ "$follow" = 1 ]; then
+  if [ "$copy" = 1 ]; then echo "gp pr: -c copies a finished listing; -f never finishes" >&2; exit 2; fi
+  if [ -n "${w_to:-}" ]; then echo "gp pr: -f follows from now on, so a window can't end at '$w_to'" >&2; exit 2; fi
+fi
 if [ -n "$limit" ] && [ "$subcmd" != "" ] && [ "$subcmd" != "list" ]; then
   echo "gp pr $subcmd: -$limit is a listing count; it doesn't apply here" >&2; exit 2
 fi
@@ -535,6 +665,7 @@ if [ "$global" = 1 ]; then
     echo "gp pr: no accounts logged in to gh (try: gh auth login)" >&2; exit 1
   fi
   _set_tfmt
+  [ "$latest" = 1 ] && _latest_run
   rows=""
   for acct in $accounts; do
     atok="$(gh auth token --user "$acct" 2>/dev/null || true)"
@@ -1220,30 +1351,13 @@ if [ "$subcmd" != "merge" ] && [ -z "$id" ]; then
   # when a finished one merged or closed.
   _set_tfmt
   when_jq='(if .state == null or .state == "OPEN" then .createdAt else .closedAt end | fromdateiso8601 | strflocaltime("'"$tfmt"'"))'
-  if [ "$latest" = 1 ]; then
-    # Finished PRs: merged and closed. --state closed covers both, and a
-    # merged PR's closedAt is its merge time. GitHub can't sort by close
-    # time, but closing updates a PR, so the most recently updated closed PRs
-    # hold the most recently closed ones. Fetch twice the count by update
-    # time and order by closedAt here. Rows carry the state (MERGED or
-    # CLOSED), as `gp pl <ids>` rows do, and a 5th field, the close time in
-    # local time, and arrive newest first, so -N keeps the latest; they're
-    # shown oldest first once cut.
-    # With a date, GitHub does the filtering and everything in the window is
-    # shown unless -N caps it; gh's own ceiling is 1000.
-    if [ -n "$merged_q" ]; then want="${limit:-1000}"; else want="${limit:-10}"; fi
-    fetch=$((want * 2)); [ "$fetch" -lt 20 ] && fetch=20; [ "$fetch" -gt 1000 ] && fetch=1000
-    gh_err=$(mktemp)
-    rc=0
-    rows="$(gh pr list --author "@me" --state closed --search "${merged_q:+$merged_q }sort:updated-desc" --limit "$fetch" \
-      --json number,url,title,state,closedAt \
-      --jq 'sort_by(.closedAt) | reverse | .[] | "\(.number)\t\(.url)\t\(.title)\t\(.state)\t\('"$when_jq"')"' 2>"$gh_err")" || rc=$?
-    err="$(cat "$gh_err")"; rm -f "$gh_err"
-    if [ "$rc" -ne 0 ]; then
-      echo "gp pr: couldn't list PRs — ${err:-gh pr list failed (exit $rc)}" >&2
-      exit 1
-    fi
-  elif [ "${#merge_ids[@]}" -eq 0 ]; then
+  exclude_nums=""
+  for xid in ${exclude_ids[@]+"${exclude_ids[@]}"}; do
+    xn="$(gh pr view "$xid" --json number --jq '.number' 2>/dev/null || true)"
+    [ -n "$xn" ] && exclude_nums="$exclude_nums $xn"
+  done
+  [ "$latest" = 1 ] && _latest_run
+  if [ "${#merge_ids[@]}" -eq 0 ]; then
     gh_err=$(mktemp)
     rc=0
     rows="$(gh pr list --author "@me" --state open --limit "${limit:-100}" --json number,url,title,createdAt \
@@ -1262,12 +1376,7 @@ $row"
     done
   fi
 
-  if [ "${#exclude_ids[@]}" -gt 0 ]; then
-    exclude_nums=""
-    for xid in ${exclude_ids[@]+"${exclude_ids[@]}"}; do
-      xn="$(gh pr view "$xid" --json number --jq '.number' 2>/dev/null || true)"
-      [ -n "$xn" ] && exclude_nums="$exclude_nums $xn"
-    done
+  if [ -n "$exclude_nums" ]; then
     filtered=""
     while IFS=$'\t' read -r num rest; do
       [ -z "$num" ] && continue
@@ -1280,13 +1389,7 @@ EOF
     rows="$filtered"
   fi
 
-  if [ "$latest" = 1 ]; then
-    # Newest first until cut to the count, only now, after -x; then shown
-    # oldest first, so the latest is at the bottom, next to the prompt.
-    rows="$(printf '%s\n' "$rows" | sed '/^$/d' | head -n "$want" | awk '{ l[NR] = $0 } END { for (i = NR; i > 0; i--) print l[i] }')"
-  else
-    rows="$(printf '%s\n' "$rows" | sed '/^$/d' | sort -t "$(printf '\t')" -k1,1n -u)"
-  fi
+  rows="$(printf '%s\n' "$rows" | sed '/^$/d' | sort -t "$(printf '\t')" -k1,1n -u)"
   # awk, not `read`: read collapses runs of tabs, which would shift a
   # time into the state field of a row whose state is empty.
   listing="$(printf '%s\n' "$rows" | sed '/^$/d' \
@@ -1299,10 +1402,6 @@ EOF
       }')"
   if [ -n "$listing" ]; then
     printf '%s\n' "$listing"
-  elif [ "$latest" = 1 ]; then
-    printf 'no merged or closed PRs%s in %s authored by %s\n' "${when:+ for '$when'}" \
-      "$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || echo '?')" \
-      "$(gh api user --jq .login 2>/dev/null || echo '?')"
   elif [ "${#merge_ids[@]}" -eq 0 ]; then
     # Genuinely zero PRs is a normal, valid state — but silence here reads
     # identically whether that's true or the wrong `gh` account is active
