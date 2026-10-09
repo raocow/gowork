@@ -116,20 +116,22 @@ while [ \$# -gt 0 ]; do
   shift
 done
 if [ "\$state" = merged ]; then
-  printf '%s' '[{"number":9,"url":"u/9","title":"nine","mergedAt":"2026-10-03T00:00:00Z"},
-               {"number":8,"url":"u/8","title":"eight","mergedAt":"2026-10-02T00:00:00Z"},
-               {"number":7,"url":"u/7","title":"seven","mergedAt":"2026-10-05T00:00:00Z"}]'
+  printf '%s' '[{"number":9,"url":"u/9","title":"nine","mergedAt":"2026-10-03T20:15:00Z"},
+               {"number":8,"url":"u/8","title":"eight","mergedAt":"2026-10-02T18:00:00Z"},
+               {"number":7,"url":"u/7","title":"seven","mergedAt":"2026-10-06T02:30:00Z"}]'
 else
   printf '%s' '[{"number":12,"url":"u/12","title":"twelve"},{"number":11,"url":"u/11","title":"eleven"}]'
 fi | jq -r "\$jq_expr"
 EOF2
 chmod +x "$FAKE/gh"
 PRREPO="$TMP/prrepo"; git init -q "$PRREPO"
-pl() { (cd "$PRREPO" && PATH="$FAKE:$PATH" "$GW" "$@" 2>&1); }
+pl() { (cd "$PRREPO" && TZ=America/Los_Angeles PATH="$FAKE:$PATH" "$GW" "$@" 2>&1); }
 out="$(pl pll)"
-check "pll lists merged PRs, newest merge first" "$out" "u/7 -- seven (merged 2026-10-05)
-u/9 -- nine (merged 2026-10-03)
-u/8 -- eight (merged 2026-10-02)"
+# #7 merged 02:30 UTC on the 6th, which is the evening of the 5th in
+# California: the time shown is local, and so is the day.
+check "pll lists merged PRs, newest merge first, in local time" "$out" "u/7 -- seven (merged 2026-10-05 19:30)
+u/9 -- nine (merged 2026-10-03 13:15)
+u/8 -- eight (merged 2026-10-02 11:00)"
 check "pl latest is the same" "$(pl pl latest)" "$out"
 check "pll -2 shows two" "$(pl pll -2 -nt)" "u/7
 u/9"

@@ -158,7 +158,7 @@ gp pr — list your open PRs, check one out, or merge one or more.
   gp pr -c                   also copy the listing to the clipboard (--copy;
                               works with any listing form, not merge)
   gp pr latest               your most recently merged PRs in this repo,
-                              newest first (10; -N for N: latest -50)
+                              newest first, with local merge time (10; -N for N)
   gp pr -N                   list at most N (-20); works with any listing
                               of your PRs: gp pr, latest, -g
   gp pr -g                   every open PR under EVERY gh account you're
@@ -1076,14 +1076,14 @@ if [ "$subcmd" != "merge" ] && [ -z "$id" ]; then
     # GitHub can't sort by merge time, but merging updates a PR, so the most
     # recently updated merged PRs hold the most recently merged ones. Fetch
     # twice the count by update time and order by mergedAt here. Rows carry a
-    # 5th field, the merge date, and arrive already in order.
+    # 5th field, the merge time in local time, and arrive already in order.
     want="${limit:-10}"
     fetch=$((want * 2)); [ "$fetch" -lt 20 ] && fetch=20
     gh_err=$(mktemp)
     rc=0
     rows="$(gh pr list --author "@me" --state merged --search "sort:updated-desc" --limit "$fetch" \
       --json number,url,title,mergedAt \
-      --jq 'sort_by(.mergedAt) | reverse | .[] | "\(.number)\t\(.url)\t\(.title)\t\t\(.mergedAt[:10])"' 2>"$gh_err")" || rc=$?
+      --jq 'sort_by(.mergedAt) | reverse | .[] | "\(.number)\t\(.url)\t\(.title)\t\t\(.mergedAt | fromdateiso8601 | strflocaltime("%Y-%m-%d %H:%M"))"' 2>"$gh_err")" || rc=$?
     err="$(cat "$gh_err")"; rm -f "$gh_err"
     if [ "$rc" -ne 0 ]; then
       echo "gp pr: couldn't list PRs — ${err:-gh pr list failed (exit $rc)}" >&2
