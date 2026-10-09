@@ -62,8 +62,12 @@ it prints just the URLs, one per line, for easy piping. Listing uses
 .BR "gp pr list latest" ,
 or the shorthand
 .BR "gp pll" )
-lists the pull requests you authored that have merged in the current
-repository, most recently merged first, each with when it merged in local time.
+lists the pull requests you authored that have merged or been closed in the
+current repository, most recent first, each tagged
+.B [MERGED]
+or
+.B [CLOSED]
+with when that happened in local time.
 It shows 10;
 .BI \- N
 shows
@@ -71,7 +75,7 @@ shows
 instead, as in
 .BR "gp pll \-50" .
 .PP
-Give it a date or time and it lists everything you merged since then:
+Give it a date or time and it lists everything you merged or closed since then:
 .B gp pll 10/5
 (from local midnight),
 .BR "gp pll 10/5 2:30pm" ,
@@ -90,7 +94,7 @@ and times
 lists a window, and either side may be left off; a bare day at the end runs
 to the end of that day, so
 .B gp pll 10/1..10/5
-includes the 5th. Times are local. GitHub filters by merge time, so a wide
+includes the 5th. Times are local. GitHub filters by close time (a merge closes a PR too), so a wide
 window is one request; everything in it is listed unless
 .BI \- N
 caps it.
