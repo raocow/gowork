@@ -14,6 +14,7 @@ case $state in
     local -a commands=(
       'pr:GitHub pull requests'
       'pl:shorthand for pr list'
+      'pll:your last merged PRs (pr latest)'
       'pm:shorthand for pr merge'
       'new:create a branch'
       'switch:git switch, plus worktree/PR resolution'

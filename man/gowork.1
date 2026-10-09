@@ -29,13 +29,19 @@ is
 gowork's own commands avoid git's names for that reason.
 .SH COMMANDS
 .TP
-.BR pr ", " pl ", " pm
+.BR pr ", " pl ", " pll ", " pm
 Pull requests: list, check out, merge, close, unmerge.
-.B pl
+.BR pl ,
+.B pll
 and
 .B pm
 are short for
-.B pr list
+.BR "pr list" ,
+.B pr latest
+(your most recently merged PRs; add
+.BI - N
+for how many, as in
+.BR "gw pll -50" )
 and
 .BR "pr merge" .
 See

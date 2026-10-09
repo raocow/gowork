@@ -122,6 +122,9 @@ check pr close 5
 check pr close --all
 check pr unmerge 5
 check pr -g
+check pr -3
+check pr latest
+check pr latest -5 -x 6
 check pr 5
 check sync -n
 check sync 5 -n

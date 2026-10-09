@@ -21,6 +21,7 @@ case $state in
       'haspr:check for open PR'
       'wsweep:delete stale worktrees'
       'pl:shorthand for pr list'
+      'pll:your last merged PRs (pr latest)'
       'pm:shorthand for pr merge'
       'help:show help'
       'version:print version'
