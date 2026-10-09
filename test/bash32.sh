@@ -125,6 +125,7 @@ check pr -g
 check pr -3
 check pr latest
 check pr latest -5 -x 6
+check pr latest 2026-10-01..2026-10-05
 check pr 5
 check sync -n
 check sync 5 -n

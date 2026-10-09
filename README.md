@@ -39,7 +39,7 @@ names for that reason.
 
 | Command | What it does | Was |
 |---|---|---|
-| `gw pr`, `gw pl`, `gw pll`, `gw pm` | pull requests: list, check out, merge, close, unmerge; `pll` lists your last merged PRs (`gw pll -50`) | `gp pr`, `gp pl`, `gp pll`, `gp pm` |
+| `gw pr`, `gw pl`, `gw pll`, `gw pm` | pull requests: list, check out, merge, close, unmerge; `pll` lists your last merged PRs (`gw pll -50`), or those merged since a time (`gw pll yesterday`, `gw pll 2026-10-01..2026-10-05`) | `gp pr`, `gp pl`, `gp pll`, `gp pm` |
 | `gw new`, `switch`, `sync`, `done`, `sweep`, `wsweep`, `haspr`, `release` | branch and worktree workflow | `gp …` |
 | `gw fork sync\|status\|pr` | forks: catch the base up with upstream, compare with it, open a PR to it | — |
 | `gw account setup\|status\|off` | gh/aws shims, git routing, Claude sandbox wiring | `rigor identity …` |

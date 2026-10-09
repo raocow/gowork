@@ -143,8 +143,25 @@ rm -f "$TMP/gh-calls"; out="$(pl pl -5)"
 check "pl still lists open PRs" "$out" "u/11 -- eleven
 u/12 -- twelve"
 saw "pl -5 limits the open listing" "$(cat "$TMP/gh-calls")" "--state open --limit 5"
+# A date argument becomes GitHub's merged: qualifier, in local time with its
+# offset, so GitHub does the filtering. With a date there is no default cap.
+rm -f "$TMP/gh-calls"; pl pll 2026-10-05 >/dev/null
+saw "pll <date> asks GitHub for merges since that local midnight" "$(cat "$TMP/gh-calls")" \
+  "--search merged:>=2026-10-05T00:00:00-07:00 sort:updated-desc --limit 1000"
+rm -f "$TMP/gh-calls"; pl pll 2026-10-05 14:30 -5 >/dev/null
+saw "pll <date> <time>, as two words, is one point; -N still caps" "$(cat "$TMP/gh-calls")" \
+  "--search merged:>=2026-10-05T14:30:00-07:00 sort:updated-desc --limit 20"
+rm -f "$TMP/gh-calls"; pl pl latest 2026-10-01..2026-10-05 >/dev/null
+saw "a window's end date runs to the end of that day" "$(cat "$TMP/gh-calls")" \
+  "merged:2026-10-01T00:00:00-07:00..2026-10-05T23:59:59-07:00"
+rm -f "$TMP/gh-calls"; pl pll ..2026-12-01T09:00 >/dev/null
+saw "..<when> means up to then (standard time in December)" "$(cat "$TMP/gh-calls")" \
+  "merged:<=2026-12-01T09:00:00-08:00"
 out="$(pl pll 3)"; rc=$?
 check "pll takes no ids" "$rc" "2"
+saw "...and says what it does take" "$out" "isn't a date or time"
+out="$(pl pll 2026-02-31)"; rc=$?
+check "pll refuses a date that doesn't exist" "$rc" "2"
 out="$(pl pm 3 -5)"; rc=$?
 check "a count doesn't apply to merge" "$rc" "2"
 out="$(pl pll -0)"; rc=$?

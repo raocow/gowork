@@ -10,6 +10,7 @@ gp-pr \- list, check out, merge, close, or revert pull requests
 .br
 .B gp pr
 .B latest
+.RI [ WHEN | FROM .. TO ]
 [\fB\-\fIN\fR]
 [\fB\-x\fR \fIID\fR ...]
 .br
@@ -63,12 +64,31 @@ or the shorthand
 .BR "gp pll" )
 lists the pull requests you authored that have merged in the current
 repository, most recently merged first, each with when it merged in local time
-.RI ( YYYY-MM-DD " " HH:MM ). It shows 10;
+.RI ( YYYY-MM-DD " " HH:MM ).
+It shows 10;
 .BI \- N
 shows
 .I N
 instead, as in
 .BR "gp pll \-50" .
+.PP
+Give it a date or time and it lists everything you merged since then:
+.B gp pll 2026\-10\-05
+(from local midnight),
+.BR "gp pll 2026\-10\-05 14:30" ,
+.B gp pll 14:30
+(today),
+.BR "gp pll yesterday" ,
+or a span ago:
+.BR 45m ", " 12h ", " 3d ", " 2w .
+.IB FROM .. TO
+lists a window, and either side may be left off; a bare day at the end runs
+to the end of that day, so
+.B gp pll 2026\-10\-01..2026\-10\-05
+includes the 5th. Times are local. GitHub filters by merge time, so a wide
+window is one request; everything in it is listed unless
+.BI \- N
+caps it.
 .PP
 Given a
 .IR NUMBER ,
