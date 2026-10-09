@@ -30,7 +30,7 @@ Commands:
 
 Shorthands:
   pl          = gp pr list
-  pll         = gp pr latest  (your last merged PRs; -N for how many)
+  pll         = gp pr latest  (your last merged/closed PRs; -N for how many)
   pm          = gp pr merge
 
   gp help     show this help

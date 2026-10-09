@@ -157,9 +157,10 @@ gp pr — list your open PRs, check one out, or merge one or more.
   gp pr -nt                  list them as bare URLs (--no-title)
   gp pr -c                   also copy the listing to the clipboard (--copy;
                               works with any listing form, not merge)
-  gp pr latest               your most recently merged PRs in this repo,
-                              newest first, with local merge time (10; -N for N)
-  gp pr latest <when>        everything you merged since <when>: 10/5,
+  gp pr latest               your most recently merged or closed PRs in
+                              this repo, newest first, tagged [MERGED] or
+                              [CLOSED], with local time (10; -N for N)
+  gp pr latest <when>        everything you merged or closed since <when>: 10/5,
                               '10/5 2:30pm', 2pm, 2026-10-05, yesterday, 3d;
                               <from>..<to> for a window (-N still caps it).
                               Times are American; GOWORK_TIME_FORMAT or
@@ -237,10 +238,10 @@ subcmd=""
 all=0
 dry=0
 method=""
-latest=0         # list recently merged PRs instead of open ones (`latest`, `pll`)
+latest=0         # list recently merged/closed PRs instead of open ones (`latest`, `pll`)
 when=""          # `latest`'s date/time argument, as typed
 fmt=""           # us | eu | iso, from _time_format
-merged_q=""      # ...and as a GitHub merged: qualifier
+merged_q=""      # ...and as a GitHub closed: qualifier
 limit=""         # -N: how many to list ("" = each listing's default)
 raw_targets=()   # positional args before -x: ids and/or "NNN-MMM" ranges
 raw_methods=()   # parallel to raw_targets: that id's merge method ("" = default)
@@ -265,13 +266,13 @@ _claim_pending() {  # _claim_pending <method>
 }
 
 # --- dates for `latest` --------------------------------------------------
-# `gp pr latest <when>` lists what merged since <when>, and `<a>..<b>` what
-# merged between the two. A point is a local date, a time, or both:
+# `gp pr latest <when>` lists what merged or closed since <when>, and
+# `<a>..<b>` what did between the two. A point is a local date, a time, or both:
 #   dates  10/5  10/5/2026  10/5/26  2026-10-05  today  yesterday
 #   times  2:30pm  2pm  14:30          (a time alone means today)
 #   ago    45m  12h  3d  2w
 # As the end of a window, a bare day runs to its last second. Each point
-# becomes an ISO 8601 time with the local offset, which GitHub's merged:
+# becomes an ISO 8601 time with the local offset, which GitHub's closed:
 # qualifier takes as-is, so the filtering happens on GitHub's side. Both BSD
 # date (macOS) and GNU date are handled.
 #
@@ -483,9 +484,9 @@ else
     merged_q=""
     if [ -n "$w_from" ]; then from_iso="$(_when_iso "$w_from")" || _when_bad "$w_from"; fi
     if [ -n "$w_to" ]; then to_iso="$(_when_iso "$w_to" end)" || _when_bad "$w_to"; fi
-    if [ -n "$w_from" ] && [ -n "$w_to" ]; then merged_q="merged:$from_iso..$to_iso"
-    elif [ -n "$w_from" ]; then merged_q="merged:>=$from_iso"
-    else merged_q="merged:<=$to_iso"; fi
+    if [ -n "$w_from" ] && [ -n "$w_to" ]; then merged_q="closed:$from_iso..$to_iso"
+    elif [ -n "$w_from" ]; then merged_q="closed:>=$from_iso"
+    else merged_q="closed:<=$to_iso"; fi
   fi
   if [ -n "$limit" ] && [ "${#raw_targets[@]}" -gt 0 ]; then
     echo "gp pr: -$limit limits a listing of your PRs; it doesn't apply to named ids" >&2; exit 2
@@ -1206,10 +1207,13 @@ fi
 if [ "$subcmd" != "merge" ] && [ -z "$id" ]; then
   rows=""
   if [ "$latest" = 1 ]; then
-    # GitHub can't sort by merge time, but merging updates a PR, so the most
-    # recently updated merged PRs hold the most recently merged ones. Fetch
-    # twice the count by update time and order by mergedAt here. Rows carry a
-    # 5th field, the merge time in local time, and arrive already in order.
+    # Finished PRs: merged and closed. --state closed covers both, and a
+    # merged PR's closedAt is its merge time. GitHub can't sort by close
+    # time, but closing updates a PR, so the most recently updated closed PRs
+    # hold the most recently closed ones. Fetch twice the count by update
+    # time and order by closedAt here. Rows carry the state (MERGED or
+    # CLOSED), as `gp pl <ids>` rows do, and a 5th field, the close time in
+    # local time, and arrive already in order.
     # With a date, GitHub does the filtering and everything in the window is
     # shown unless -N caps it; gh's own ceiling is 1000.
     if [ -n "$merged_q" ]; then want="${limit:-1000}"; else want="${limit:-10}"; fi
@@ -1222,9 +1226,9 @@ if [ "$subcmd" != "merge" ] && [ -z "$id" ]; then
     fetch=$((want * 2)); [ "$fetch" -lt 20 ] && fetch=20; [ "$fetch" -gt 1000 ] && fetch=1000
     gh_err=$(mktemp)
     rc=0
-    rows="$(gh pr list --author "@me" --state merged --search "${merged_q:+$merged_q }sort:updated-desc" --limit "$fetch" \
-      --json number,url,title,mergedAt \
-      --jq 'sort_by(.mergedAt) | reverse | .[] | "\(.number)\t\(.url)\t\(.title)\t\t\(.mergedAt | fromdateiso8601 | strflocaltime("'"$tfmt"'"))"' 2>"$gh_err")" || rc=$?
+    rows="$(gh pr list --author "@me" --state closed --search "${merged_q:+$merged_q }sort:updated-desc" --limit "$fetch" \
+      --json number,url,title,state,closedAt \
+      --jq 'sort_by(.closedAt) | reverse | .[] | "\(.number)\t\(.url)\t\(.title)\t\(.state)\t\(.closedAt | fromdateiso8601 | strflocaltime("'"$tfmt"'"))"' 2>"$gh_err")" || rc=$?
     err="$(cat "$gh_err")"; rm -f "$gh_err"
     if [ "$rc" -ne 0 ]; then
       echo "gp pr: couldn't list PRs — ${err:-gh pr list failed (exit $rc)}" >&2
@@ -1268,25 +1272,25 @@ EOF
   fi
 
   if [ "$latest" = 1 ]; then
-    # Already newest-merged first; cut to the count only now, after -x.
+    # Already newest-closed first; cut to the count only now, after -x.
     rows="$(printf '%s\n' "$rows" | sed '/^$/d' | head -n "$want")"
   else
     rows="$(printf '%s\n' "$rows" | sed '/^$/d' | sort -t "$(printf '\t')" -k1,1n -u)"
   fi
   # awk, not `read`: read collapses runs of tabs, which would shift a
-  # `latest` row's date (after its empty state field) into the state.
+  # date into the state field of a row whose state is empty.
   listing="$(printf '%s\n' "$rows" | sed '/^$/d' \
     | awk -F '\t' -v nt="$notitle" -v dim="$_dim" -v off="$_off" '{
         line = $2
         if (nt != 1) line = line " -- " $3
         if ($4 != "" && $4 != "OPEN") line = line " [" $4 "]"
-        if (nt != 1 && $5 != "") line = line " " dim "(merged " $5 ")" off
+        if (nt != 1 && $5 != "") line = line " " dim "(" $5 ")" off
         print line
       }')"
   if [ -n "$listing" ]; then
     printf '%s\n' "$listing"
   elif [ "$latest" = 1 ]; then
-    printf 'no merged PRs%s in %s authored by %s\n' "${when:+ for '$when'}" \
+    printf 'no merged or closed PRs%s in %s authored by %s\n' "${when:+ for '$when'}" \
       "$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || echo '?')" \
       "$(gh api user --jq .login 2>/dev/null || echo '?')"
   elif [ "${#merge_ids[@]}" -eq 0 ]; then
