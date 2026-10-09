@@ -11,6 +11,9 @@ gp-pr \- list, check out, merge, close, or revert pull requests
 .B gp pr
 .B latest
 .RI [ WHEN | FROM .. TO ]
+[\fB\-f\fR|\fB\-\-follow\fR]
+[\fB\-e\fR|\fB\-\-everyone\fR]
+[\fB\-g\fR|\fB\-\-global\fR]
 [\fB\-\fIN\fR]
 [\fB\-x\fR \fIID\fR ...]
 .br
@@ -101,6 +104,21 @@ includes the 5th. Times are local. GitHub filters by close time (a merge closes 
 window is one request; everything in it is listed unless
 .BI \- N
 caps it.
+.PP
+.B gp pll \-f
+is a stream: it lists as above, then stays open and adds each PR to the bottom
+as it merges or closes, until Ctrl-C. It asks GitHub every 30 seconds
+.RB ( GOWORK_FOLLOW_INTERVAL
+sets another) for what closed in the last ten minutes and prints what it
+hasn't shown, so nothing appears twice.
+.B \-e
+lists anyone's PRs in the repository, not just yours, with each author;
+.B \-g
+lists yours across every repository, under every
+.B gh
+account, with the account. Both work with or without
+.BR \-f ,
+but not together, since everyone's PRs everywhere is all of GitHub.
 .PP
 Times are American by default. To change them, set
 .B GOWORK_TIME_FORMAT
@@ -431,8 +449,23 @@ When listing, print bare URLs (one per line) instead of
 When listing, also copy the listing to the clipboard. Not valid with
 .BR "gp pr merge" .
 .TP
+.BR \-f ", " \-\-follow
+With
+.BR latest ,
+stay open and add each PR as it merges or closes. Not valid with
+.B \-c
+or with a window that ends.
+.TP
+.BR \-e ", " \-\-everyone
+With
+.BR latest ,
+list anyone's PRs in the repository, with the author.
+.TP
 .BR \-g ", " \-\-global
-List every open pull request you have anywhere, under every account you are
+With
+.BR latest ,
+list your merged and closed PRs across every repository and account, as
+described above. Otherwise, list every open pull request you have anywhere, under every account you are
 logged into with
 .BR gh " " \(em
 not just the active one, and not scoped to a repository, so it also works

@@ -30,7 +30,7 @@ Usage: gw <command> [args...]      (anything else goes to git: gw pull, gw log)
 Git and pull requests:
   pr          pull requests: list, checkout, merge, close, unmerge
   pl          = gw pr list            pm   = gw pr merge
-  pll         = gw pr latest: your last merged/closed PRs (gw pll -50 for 50)
+  pll         = gw pr latest: your last merged/closed PRs (-50 for 50; -f to follow)
   new         create a branch and switch to it
   switch      everything git switch does, plus worktree/PR-aware resolution
   sync        rebase branches onto their base
