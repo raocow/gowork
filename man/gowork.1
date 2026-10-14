@@ -84,7 +84,7 @@ Open GitHub links in the Chrome profile signed in to the right account, via
 Finicky as the default browser, with rules generated from the accounts and
 their bindings.
 .TP
-.BR feed " [" \fIwhen\fR "] [" \-f "] [" \-e "] [" \-g "] [" \-\fIN\fR ]
+.BR feed " [" \fIwhen\fR "] [" \-e "] [" \-g "] [" \-\fIN\fR "] [" \-\-once ]
 Your latest merged and closed PRs, oldest first, each tagged
 .B [MERGED]
 or
@@ -93,8 +93,11 @@ the listing is
 .B gp pr latest
 (see
 .BR gp-pr (1)).
-.B \-f
-stays open and adds each PR as it merges or closes,
+In a terminal it then stays open and adds each PR as it merges or closes,
+until Ctrl-C;
+.BR \-\-once ,
+.BR \-c ,
+a window with an end, or output into a pipe prints it once instead.
 .B \-e
 shows everyone's in the repository,
 .B \-g

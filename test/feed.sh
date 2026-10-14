@@ -164,6 +164,20 @@ check "...and removes the job" "$([ -f "$GOWORK_FEED_PLIST" ] && echo there || e
 
 echo "== the listing =="
 saw "gw feed help covers review" "$(gw feed help)" "gw feed review"
+# In a terminal, bare `gw feed` is a stream; into a pipe, or with --once, it
+# prints once. script(1) gives it a terminal.
+git init -q "$TMP/repo"
+out="$(cd "$TMP/repo" && GOWORK_FOLLOW_INTERVAL=0.2 gw feed 2>&1)"
+nosaw "into a pipe, gw feed prints once" "$out" "watching for PRs"
+(cd "$TMP/repo" && PATH="$FAKE:$PATH" GOWORK_FOLLOW_INTERVAL=0.2 \
+  exec script -q /dev/null "$GW" feed >"$TMP/tty.out" 2>&1 </dev/null) & spid=$!
+sleep 2; kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null
+saw "in a terminal, gw feed keeps watching" "$(cat "$TMP/tty.out")" "watching for PRs"
+(cd "$TMP/repo" && PATH="$FAKE:$PATH" GOWORK_FOLLOW_INTERVAL=0.2 \
+  exec script -q /dev/null "$GW" feed --once >"$TMP/once.out" 2>&1 </dev/null) & spid=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$spid" 2>/dev/null || break; sleep 0.5; done
+if kill -0 "$spid" 2>/dev/null; then kill "$spid"; bad "gw feed --once finishes in a terminal"; else ok "gw feed --once finishes in a terminal"; fi
+nosaw "...without watching" "$(cat "$TMP/once.out")" "watching for PRs"
 nosaw "pll is gone from gw help" "$(gw help)" "pll"
 
 echo
