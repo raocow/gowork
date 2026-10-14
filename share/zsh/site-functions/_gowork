@@ -14,7 +14,6 @@ case $state in
     local -a commands=(
       'pr:GitHub pull requests'
       'pl:shorthand for pr list'
-      'pll:your last merged PRs (pr latest)'
       'pm:shorthand for pr merge'
       'new:create a branch'
       'switch:git switch, plus worktree/PR resolution'
@@ -31,6 +30,7 @@ case $state in
       'notify:phone notifications for agent turns'
       'sleep:keep the Mac awake'
       'browser:open GitHub links in the right Chrome profile'
+      'feed:your merged PRs; approve them as a Slack update'
       'migrate:move a rigor/gitplus setup to gowork'
       'help:show help'
       'version:print version'
@@ -78,6 +78,16 @@ case $state in
         (( CURRENT == 2 )) && { local -a subs=(setup status test off); _describe 'notify command' subs; } ;;
       browser)
         (( CURRENT == 2 )) && { local -a subs=(setup sync status off rules add remove open); _describe 'browser command' subs; } ;;
+      feed)
+        (( CURRENT == 2 )) && { local -a subs=(
+          'review:approve or withhold queued updates, then post'
+          'collect:queue what merged since the last collect'
+          'channel:add or remove a Slack webhook'
+          'route:send a repo, or owner/*, to a channel'
+          'setup:collect daily (--at HH:MM)'
+          'status:channels, routes, schedule, queue'
+          'off:stop the daily collect'
+        ); _describe 'feed command' subs; } ;;
       sleep)
         (( CURRENT == 2 )) && { local -a subs=(on off status); _describe 'sleep command' subs; } ;;
       *)

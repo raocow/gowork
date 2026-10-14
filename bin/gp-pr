@@ -246,13 +246,14 @@ subcmd=""
 all=0
 dry=0
 method=""
-latest=0         # list recently merged/closed PRs instead of open ones (`latest`, `pll`)
+latest=0         # list recently merged/closed PRs instead of open ones (`latest`, `gw feed`)
 when=""          # `latest`'s date/time argument, as typed
 fmt=""           # us | eu | iso, from _time_format
 merged_q=""      # ...and as a GitHub closed: qualifier
 limit=""         # -N: how many to list ("" = each listing's default)
 follow=0         # -f: `latest` stays open and prints each PR as it merges or closes
 everyone=0       # -e: `latest` lists anyone's PRs, not just yours
+raw=0            # --raw: `latest` prints its rows as they are, for scripts (gw feed)
 raw_targets=()   # positional args before -x: ids and/or "NNN-MMM" ranges
 raw_methods=()   # parallel to raw_targets: that id's merge method ("" = default)
 raw_excludes=()  # positional args after -x/--exclude
@@ -372,6 +373,9 @@ _latest_run() {  # list the latest finished PRs, follow them with -f; exits
   # Newest first to cut to the count, after -x; then shown oldest first, so
   # the latest is at the bottom, next to the prompt.
   rows="$(printf '%s\n' "$all" | _fin_keep | sort -t "$_tab" -k7,7r | head -n "$want" | sort -t "$_tab" -k7,7)"
+  # --raw: the rows themselves, one per line (see _fin_rows), and nothing
+  # else, not even when there are none.
+  if [ "$raw" = 1 ]; then printf '%s\n' "$rows" | _fin_keep; exit 0; fi
   listing="$(printf '%s\n' "$rows" | _fin_keep | _fin_render)"
   if [ -n "$listing" ]; then
     printf '%s\n' "$listing"
@@ -526,6 +530,7 @@ while [ $# -gt 0 ]; do
     -x|--exclude) in_exclude=1 ;;
     -f|--follow) follow=1; in_exclude=0 ;;
     -e|--everyone) everyone=1; in_exclude=0 ;;
+    --raw) raw=1; in_exclude=0 ;;
     # -N sets how many to list (`gp pr latest -100`). A number is never a
     # flag otherwise, so `-12` can't be mistaken for anything else.
     -[0-9]*)
@@ -625,7 +630,10 @@ else
   fi
 fi
 if [ "$latest" = 0 ] && { [ "$follow" = 1 ] || [ "$everyone" = 1 ]; }; then
-  echo "gp pr: -f/--follow and -e/--everyone go with 'latest' (gp pll -f)" >&2; exit 2
+  echo "gp pr: -f/--follow and -e/--everyone go with 'latest' (gw feed -f)" >&2; exit 2
+fi
+if [ "$raw" = 1 ] && { [ "$latest" = 0 ] || [ "$follow" = 1 ] || [ "$copy" = 1 ]; }; then
+  echo "gp pr: --raw prints a 'latest' listing once, for scripts; not with -f or -c" >&2; exit 2
 fi
 if [ "$follow" = 1 ]; then
   if [ "$copy" = 1 ]; then echo "gp pr: -c copies a finished listing; -f never finishes" >&2; exit 2; fi
