@@ -39,7 +39,7 @@ Git and pull requests:
   wsweep      delete worktrees whose branches are gone
   haspr       check whether a branch has an open PR
   release     tag and publish a GitHub release
-  feed        your latest merged/closed PRs (-50 for 50; -f to follow, -g everywhere)
+  feed        your merged/closed PRs, live until Ctrl-C (--once to print once; -g everywhere)
   feed review|collect|setup        approve them as a Slack update, collected daily
   feed channel|route|status|off    Slack webhooks, and which repo goes where
 

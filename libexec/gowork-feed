@@ -2,8 +2,10 @@
 # gw feed — your merged PRs: as a list, as a stream, or as a Slack update you
 # approve first.
 #
-#   gw feed [<when>] [-N] [-f] [-e] [-g] [-x <ids>] [-nt] [-c]
-#                         your latest merged and closed PRs; -f keeps watching
+#   gw feed [<when>] [-N] [-e] [-g] [-x <ids>] [-nt] [--once]
+#                         your latest merged and closed PRs, then each one as
+#                         it merges or closes, until Ctrl-C; --once (or -c, a
+#                         window with an end, or output to a pipe) prints once
 #                         (the listing is `gp pr latest`; see gp-pr(1))
 #   gw feed review        go through the queued updates: keep or withhold each,
 #                         reword it, then post one digest per channel
@@ -445,6 +447,22 @@ case "${1:-}" in
   status)  shift; cmd_status "$@" ;;
   off)     shift; cmd_off "$@" ;;
   help|-h|--help) usage ;;
-  # Anything else is the listing: gw feed, gw feed -f, gw feed yesterday -g.
-  *) exec "$ROOT/bin/gp-pr" latest "$@" ;;
+  # Anything else is the listing: gw feed, gw feed yesterday -g. In a
+  # terminal it's a stream (gp pr latest -f) unless asked for once: --once,
+  # or what can't stream (-c, --raw, a window that ends). Into a pipe it's
+  # once, so `gw feed | pbcopy` finishes, unless -f says to stream anyway;
+  # an explicit -f is passed on as given, so gp pr still refuses -f -c.
+  *)
+    once=0; args=()
+    for a in "$@"; do
+      case "$a" in
+        --once) once=1 ;;
+        -c|--copy|--raw|*..?*) once=1; args+=("$a") ;;
+        -f|--follow) once=2; args+=("$a") ;;
+        *) args+=("$a") ;;
+      esac
+    done
+    [ "$once" = 0 ] && [ ! -t 1 ] && once=1
+    if [ "$once" != 0 ]; then exec "$ROOT/bin/gp-pr" latest ${args[@]+"${args[@]}"}
+    else exec "$ROOT/bin/gp-pr" latest -f ${args[@]+"${args[@]}"}; fi ;;
 esac
