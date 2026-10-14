@@ -1,0 +1,450 @@
+#!/usr/bin/env bash
+# gw feed — your merged PRs: as a list, as a stream, or as a Slack update you
+# approve first.
+#
+#   gw feed [<when>] [-N] [-f] [-e] [-g] [-x <ids>] [-nt] [-c]
+#                         your latest merged and closed PRs; -f keeps watching
+#                         (the listing is `gp pr latest`; see gp-pr(1))
+#   gw feed review        go through the queued updates: keep or withhold each,
+#                         reword it, then post one digest per channel
+#   gw feed collect       queue what you've merged since the last collect; the
+#                         daily job runs this, then notifies your phone
+#   gw feed channel add <name> [<webhook url>]   a Slack channel to post to
+#   gw feed channel rm <name>
+#   gw feed route <owner/repo | owner/*> <channel>   post that repo's updates there
+#   gw feed route rm <owner/repo | owner/*>
+#   gw feed setup [--at HH:MM]   collect every day at that time (17:00)
+#   gw feed status
+#   gw feed off           stop the daily job; channels, routes and the queue stay
+#
+# Posting goes through Slack incoming webhooks, one per channel, so the
+# message shows as the webhook's app rather than as you; the digest's first
+# line names you (git config gowork.feedHeading changes it). A repo with no
+# route is never queued, so nothing reaches Slack until you've said where it
+# goes, and nothing is posted until you approve it in `gw feed review`.
+set -uo pipefail
+
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+ROOT="$(cd -P "$(dirname "$_src")/.." && pwd)"
+SELF="$ROOT/libexec/gowork-feed"
+
+CONF="${GOWORK_FEED_CONF:-$HOME/.config/rigor/feed}"
+STATE="${GOWORK_FEED_STATE:-$HOME/.local/share/rigor/feed}"
+# "<name>\t<webhook url>" per line. The URL is the only credential a webhook
+# has, so the file is kept private, like push.env.
+CHANNELS="$CONF/channels"
+# "<owner/repo or owner/*>\t<channel>" per line; an exact repo beats owner/*.
+ROUTES="$CONF/routes"
+# Waiting for review, one PR per line:
+#   url, repo, channel, local time, closedAt (UTC), title
+QUEUE="$STATE/queue"
+# Every PR already decided, so it never comes back: "<url>\t<posted|withheld>\t<when>"
+DECIDED="$STATE/decided"
+LAST="$STATE/last-collect"   # ISO time of the last collect
+LABEL="net.raocow.gowork.feed"
+PLIST="${GOWORK_FEED_PLIST:-$HOME/Library/LaunchAgents/$LABEL.plist}"
+TAB="$(printf '\t')"
+
+die() { echo "gw feed: $*" >&2; exit 1; }
+usage() { sed -n '2,/^set -uo/p' "$SELF" | sed '$d' | sed 's/^# \{0,1\}//'; }
+
+# --- channels and routes -------------------------------------------------
+_channel_url() {  # _channel_url <name> -> webhook url, or fail
+  [ -f "$CHANNELS" ] || return 1
+  awk -F '\t' -v n="$1" '$1 == n { print $2; found = 1; exit } END { exit !found }' "$CHANNELS"
+}
+_channel_of() {  # _channel_of <owner/repo> -> channel, or fail
+  [ -f "$ROUTES" ] || return 1
+  awk -F '\t' -v r="$1" '
+    $1 == r { exact = $2 }
+    $1 ~ /\/\*$/ && index(r, substr($1, 1, length($1) - 1)) == 1 { owner = $2 }
+    END { if (exact != "") print exact; else if (owner != "") print owner; else exit 1 }
+  ' "$ROUTES"
+}
+_drop_key() {  # _drop_key <file> <first field>: remove that line, keeping the file's mode
+  [ -f "$1" ] || return 0
+  awk -F '\t' -v k="$2" '$1 != k' "$1" > "$1.tmp" && cat "$1.tmp" > "$1" && rm -f "$1.tmp"
+}
+
+cmd_channel() {
+  local sub="${1:-}" name url
+  case "$sub" in
+    add)
+      name="${2:-}"; url="${3:-}"
+      [ -n "$name" ] || die "channel add <name> [<webhook url>]"
+      case "$name" in *"$TAB"*|*" "*) die "a channel name can't contain spaces" ;; esac
+      name="${name#\#}"
+      if [ -z "$url" ]; then
+        # Read rather than taken as an argument, so the URL stays out of
+        # shell history.
+        [ -t 0 ] && printf 'Webhook URL for #%s (Slack: Apps > Incoming Webhooks): ' "$name" >&2
+        IFS= read -r url || true
+        [ -t 0 ] && echo >&2
+      fi
+      case "$url" in
+        https://hooks.slack.com/*) ;;
+        *) die "that isn't a Slack webhook URL (https://hooks.slack.com/...)" ;;
+      esac
+      mkdir -p "$CONF"
+      ( umask 077; touch "$CHANNELS" ); chmod 600 "$CHANNELS"
+      _drop_key "$CHANNELS" "$name"
+      printf '%s\t%s\n' "$name" "$url" >> "$CHANNELS"
+      echo "added #$name" ;;
+    rm|remove)
+      name="${2#\#}"
+      [ -n "$name" ] || die "channel rm <name>"
+      _channel_url "$name" >/dev/null || die "no channel #$name"
+      _drop_key "$CHANNELS" "$name"
+      echo "removed #$name"
+      if [ -f "$ROUTES" ] && awk -F '\t' -v n="$name" '$2 == n { f = 1 } END { exit !f }' "$ROUTES"; then
+        echo "  routes still pointing at it are skipped until you route them elsewhere:"
+        awk -F '\t' -v n="$name" '$2 == n { print "    " $1 }' "$ROUTES"
+      fi ;;
+    *) die "channel add <name> [<webhook url>] | channel rm <name>" ;;
+  esac
+}
+
+cmd_route() {
+  local pat="${1:-}" chan="${2:-}"
+  if [ "$pat" = rm ] || [ "$pat" = remove ]; then
+    pat="${2:-}"
+    [ -n "$pat" ] || die "route rm <owner/repo | owner/*>"
+    [ -f "$ROUTES" ] && awk -F '\t' -v p="$pat" '$1 == p { f = 1 } END { exit !f }' "$ROUTES" \
+      || die "no route for $pat"
+    _drop_key "$ROUTES" "$pat"; echo "removed the route for $pat"; return
+  fi
+  [ -n "$pat" ] && [ -n "$chan" ] || die "route <owner/repo | owner/*> <channel>"
+  case "$pat" in
+    */\*|*/*) ;;
+    *) die "route a repo as owner/repo, or a whole owner as owner/*" ;;
+  esac
+  case "$pat" in */*/*) die "route a repo as owner/repo, or a whole owner as owner/*" ;; esac
+  chan="${chan#\#}"
+  _channel_url "$chan" >/dev/null || die "no channel #$chan (add it: gw feed channel add $chan)"
+  mkdir -p "$CONF"
+  _drop_key "$ROUTES" "$pat"
+  printf '%s\t%s\n' "$pat" "$chan" >> "$ROUTES"
+  echo "$pat -> #$chan"
+}
+
+# --- collect -------------------------------------------------------------
+_now_local() { date '+%Y-%m-%dT%H:%M'; }
+_ago_local() {  # _ago_local <seconds> -> local YYYY-MM-DDTHH:MM that long ago
+  local t=$(( $(date +%s) - $1 ))
+  date -r "$t" '+%Y-%m-%dT%H:%M' 2>/dev/null || date -d "@$t" '+%Y-%m-%dT%H:%M'
+}
+_epoch_of_local() {  # _epoch_of_local YYYY-MM-DDTHH:MM -> epoch
+  date -j -f '%Y-%m-%dT%H:%M' "$1" '+%s' 2>/dev/null || date -d "${1/T/ }" '+%s'
+}
+_known() {  # _known <url>: already queued or decided
+  { [ -f "$QUEUE" ] && cut -f1 "$QUEUE" | grep -qxF "$1"; } \
+    || { [ -f "$DECIDED" ] && cut -f1 "$DECIDED" | grep -qxF "$1"; }
+}
+_queued() { if [ -f "$QUEUE" ]; then grep -c . "$QUEUE" || true; else echo 0; fi; }
+
+cmd_collect() {
+  local quiet=0 since now rows added=0 skipped="" url title when closed repo chan n
+  [ "${1:-}" = --quiet ] && quiet=1
+  mkdir -p "$STATE"
+  now="$(_now_local)"
+  # From an hour before the last collect, so a PR GitHub's search index hadn't
+  # caught up with last time is still found; what's already known is skipped.
+  # The first collect looks back a day.
+  if [ -s "$LAST" ]; then
+    since="$(_ago_local $(( $(date +%s) - $(_epoch_of_local "$(cat "$LAST")") + 3600 )))"
+  else
+    since="$(_ago_local 86400)"
+  fi
+  rows="$("$ROOT/bin/gp-pr" latest -g --raw "$since")" || die "couldn't list your PRs"
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    [ "$(printf '%s' "$row" | cut -f4)" = MERGED ] || continue
+    url="$(printf '%s' "$row" | cut -f2)"
+    _known "$url" && continue
+    repo="$(printf '%s' "$url" | sed -E 's#^https://[^/]+/([^/]+/[^/]+)/pull/.*#\1#')"
+    if ! chan="$(_channel_of "$repo")" || ! _channel_url "$chan" >/dev/null; then
+      case " $skipped " in *" $repo "*) ;; *) skipped="$skipped $repo" ;; esac
+      continue
+    fi
+    title="$(printf '%s' "$row" | cut -f3)"
+    when="$(printf '%s' "$row" | cut -f5)"
+    closed="$(printf '%s' "$row" | cut -f7)"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$url" "$repo" "$chan" "$when" "$closed" "$title" >> "$QUEUE"
+    added=$((added + 1))
+  done <<EOF
+$rows
+EOF
+  printf '%s\n' "$now" > "$LAST"
+  n="$(_queued)"
+  if [ "$quiet" = 0 ]; then
+    echo "queued $added; $n waiting for review"
+    [ -z "$skipped" ] || echo "  not routed, so not queued:$skipped"
+  fi
+  # A phone notification only when there's something new to decide; the
+  # notifier stays silent when `gw notify` isn't set up.
+  if [ "$added" -gt 0 ] && [ -x "$ROOT/share/rigor/push/send" ]; then
+    "$ROOT/share/rigor/push/send" "gw feed" "$n update$([ "$n" = 1 ] || echo s) to review: gw feed review" default newspaper
+  fi
+  return 0
+}
+
+# --- review --------------------------------------------------------------
+# The queue is loaded into parallel arrays, grouped by channel and in merge
+# order within each; keep[i] is 1 to post, 0 to withhold.
+_load() {
+  urls=(); repos=(); chans=(); whens=(); closeds=(); titles=(); keep=()
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    urls+=("$(printf '%s' "$line" | cut -f1)")
+    repos+=("$(printf '%s' "$line" | cut -f2)")
+    chans+=("$(printf '%s' "$line" | cut -f3)")
+    whens+=("$(printf '%s' "$line" | cut -f4)")
+    closeds+=("$(printf '%s' "$line" | cut -f5)")
+    titles+=("$(printf '%s' "$line" | cut -f6-)")
+    keep+=(1)
+  done <<EOF
+$(sort -t "$TAB" -k3,3 -k5,5 "$QUEUE" 2>/dev/null)
+EOF
+}
+
+_esc() {  # Slack mrkdwn needs only these three escaped
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+_heading() {
+  local h
+  h="$(git config --global --get gowork.feedHeading 2>/dev/null || true)"
+  [ -n "$h" ] || h="*$(git config --global --get user.name 2>/dev/null || echo "$USER") merged:*"
+  printf '%s' "$h"
+}
+_digest() {  # _digest <channel> -> the message text for its kept items
+  local c="$1" i last="" num out
+  out="$(_heading)"
+  for i in ${urls[@]+"${!urls[@]}"}; do
+    [ "${chans[$i]}" = "$c" ] && [ "${keep[$i]}" = 1 ] || continue
+    if [ "${repos[$i]}" != "$last" ]; then
+      out="$out
+*${repos[$i]#*/}*"
+      last="${repos[$i]}"
+    fi
+    num="${urls[$i]##*/}"
+    out="$out
+• <${urls[$i]}|#$num> $(_esc "${titles[$i]}")"
+  done
+  printf '%s' "$out"
+}
+_post() {  # _post <channel> <text>: send it to the channel's webhook
+  local url
+  url="$(_channel_url "$1")" || { echo "no webhook for #$1" >&2; return 1; }
+  # perl for the JSON, as gw browser does; jq isn't a dependency. The text
+  # goes through the environment, so nothing in it is interpreted.
+  FEED_TEXT="$2" perl -MJSON::PP -e 'print JSON::PP->new->canonical->encode({ text => $ENV{FEED_TEXT} })' \
+    | curl -fsS --max-time 15 -H 'Content-Type: application/json' --data-binary @- "$url" >/dev/null
+}
+
+_draw() {
+  local i last="" mark line w cols kept=0 held=0
+  cols="$(tput cols 2>/dev/null || echo 100)"
+  for i in "${!urls[@]}"; do if [ "${keep[$i]}" = 1 ]; then kept=$((kept + 1)); else held=$((held + 1)); fi; done
+  printf '\033[H\033[J'
+  printf '%sgw feed review%s  %s to post, %s withheld\n' "$B" "$O" "$kept" "$held"
+  printf '%s↑↓/jk move · space keep/withhold · e reword · a keep all · p post · q quit%s\n' "$D" "$O"
+  for i in "${!urls[@]}"; do
+    if [ "${chans[$i]}" != "$last" ]; then printf '\n%s#%s%s\n' "$B" "${chans[$i]}" "$O"; last="${chans[$i]}"; fi
+    if [ "${keep[$i]}" = 1 ]; then mark="[x]"; else mark="[ ]"; fi
+    line="${repos[$i]#*/}#${urls[$i]##*/}  ${titles[$i]}"
+    w=$((cols - 30)); [ "$w" -lt 20 ] && w=20
+    [ "${#line}" -gt "$w" ] && line="${line:0:$((w - 1))}…"
+    if [ "$i" = "$cur" ]; then
+      printf '%s> %s %s%s  %s%s%s\n' "$R" "$mark" "$line" "$O" "$D" "${whens[$i]}" "$O"
+    elif [ "${keep[$i]}" = 1 ]; then
+      printf '  %s %s  %s%s%s\n' "$mark" "$line" "$D" "${whens[$i]}" "$O"
+    else
+      printf '  %s%s %s  %s%s\n' "$D" "$mark" "$line" "${whens[$i]}" "$O"
+    fi
+  done
+}
+_key() {  # one keypress -> up|down|space|enter|<char>
+  local k rest
+  IFS= read -rsn1 k || { echo q; return; }
+  case "$k" in
+    $'\033') IFS= read -rsn2 -t 1 rest || true
+      case "$rest" in '[A') echo up ;; '[B') echo down ;; *) echo esc ;; esac ;;
+    ' ') echo space ;;
+    '') echo enter ;;
+    *) printf '%s\n' "$k" ;;
+  esac
+}
+_reword() {  # _reword <i>: edit that item's title in $VISUAL/$EDITOR
+  local f t
+  f="$(mktemp)"
+  printf '%s\n' "${titles[$1]}" > "$f"
+  # Unquoted on purpose: EDITOR may carry arguments ("code -w").
+  if [ -t 1 ]; then ${VISUAL:-${EDITOR:-vi}} "$f" < /dev/tty > /dev/tty 2>&1 || true
+  else ${VISUAL:-${EDITOR:-vi}} "$f" < /dev/null || true; fi
+  t="$(sed -n '/./{p;q;}' "$f")"; rm -f "$f"
+  [ -n "$t" ] && titles[$1]="$t"
+}
+_save_queue() {  # write back what's still waiting: items[] not in done_idx
+  local i out=""
+  for i in ${urls[@]+"${!urls[@]}"}; do
+    case " $done_idx " in *" $i "*) continue ;; esac
+    out="$out${urls[$i]}$TAB${repos[$i]}$TAB${chans[$i]}$TAB${whens[$i]}$TAB${closeds[$i]}$TAB${titles[$i]}
+"
+  done
+  printf '%s' "$out" > "$QUEUE"
+}
+_post_all() {  # post each channel's digest; returns 1 if any channel failed
+  local c i stamp failed=0 chanlist=""
+  stamp="$(_now_local)"
+  for i in "${!urls[@]}"; do
+    case " $chanlist " in *" ${chans[$i]} "*) ;; *) chanlist="$chanlist ${chans[$i]}" ;; esac
+  done
+  for c in $chanlist; do
+    local any=0
+    for i in "${!urls[@]}"; do [ "${chans[$i]}" = "$c" ] && [ "${keep[$i]}" = 1 ] && any=1; done
+    if [ "$any" = 1 ]; then
+      if ! _post "$c" "$(_digest "$c")"; then
+        # This channel's items, withheld ones too, stay queued for next time.
+        echo "gw feed: couldn't post to #$c; its updates stay queued" >&2
+        failed=1; continue
+      fi
+      echo "posted to #$c"
+    fi
+    for i in "${!urls[@]}"; do
+      [ "${chans[$i]}" = "$c" ] || continue
+      if [ "${keep[$i]}" = 1 ]; then printf '%s\tposted\t%s\n' "${urls[$i]}" "$stamp" >> "$DECIDED"
+      else printf '%s\twithheld\t%s\n' "${urls[$i]}" "$stamp" >> "$DECIDED"; fi
+      done_idx="$done_idx $i"
+    done
+  done
+  return "$failed"
+}
+
+cmd_review() {
+  local k n cur=0 kept i
+  [ -s "$QUEUE" ] || { echo "nothing to review (gw feed collect queues new merges)"; return 0; }
+  # A TUI needs a terminal. GOWORK_FEED_TTY=any lets the tests drive it
+  # through a pipe.
+  if [ "${GOWORK_FEED_TTY:-}" != any ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
+    die "review needs a terminal"
+  fi
+  _load
+  n="${#urls[@]}"
+  B=$'\033[1m'; D=$'\033[2m'; R=$'\033[7m'; O=$'\033[0m'
+  done_idx=""
+  printf '\033[?1049h\033[?25l'
+  trap 'printf "\033[?25h\033[?1049l"' EXIT
+  while :; do
+    _draw
+    k="$(_key)"
+    case "$k" in
+      up|k)   [ "$cur" -gt 0 ] && cur=$((cur - 1)) ;;
+      down|j) [ "$cur" -lt $((n - 1)) ] && cur=$((cur + 1)) ;;
+      space|x) if [ "${keep[$cur]}" = 1 ]; then keep[$cur]=0; else keep[$cur]=1; fi
+               [ "$cur" -lt $((n - 1)) ] && cur=$((cur + 1)) ;;
+      a) for i in "${!keep[@]}"; do keep[$i]=1; done ;;
+      e) printf '\033[?25h\033[?1049l'; _reword "$cur"; printf '\033[?1049h\033[?25l' ;;
+      p)
+        kept=0; for i in "${!keep[@]}"; do [ "${keep[$i]}" = 1 ] && kept=$((kept + 1)); done
+        printf '\nPost %s, withhold %s? [y/N] ' "$kept" "$((n - kept))"
+        if [ "$(_key)" = y ]; then
+          printf '\033[?25h\033[?1049l'; trap - EXIT
+          _post_all; local rc=$?
+          _save_queue
+          [ "$rc" = 0 ] || exit 1
+          return 0
+        fi ;;
+      q|esc)
+        printf '\033[?25h\033[?1049l'; trap - EXIT
+        # Rewording is kept even when you quit; keep/withhold isn't decided yet.
+        _save_queue
+        echo "left $n queued"
+        return 0 ;;
+    esac
+  done
+}
+
+# --- the daily job -------------------------------------------------------
+cmd_setup() {
+  local at="17:00" h m path
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --at) at="${2:-}"; shift ;;
+      *) die "setup [--at HH:MM]" ;;
+    esac
+    shift
+  done
+  case "$at" in [0-9]:[0-5][0-9]|[01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;; *) die "--at takes HH:MM, 24-hour (17:00)" ;; esac
+  h="$((10#${at%%:*}))"; m="$((10#${at#*:}))"
+  # launchd starts jobs with a bare PATH; gh (and its keychain) is found
+  # through the one this shell has.
+  path="$(dirname "$(command -v gh 2>/dev/null || echo /opt/homebrew/bin/gh)"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  mkdir -p "$(dirname "$PLIST")" "$STATE"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$SELF</string><string>collect</string></array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>$h</integer><key>Minute</key><integer>$m</integer></dict>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>$path</string></dict>
+  <key>StandardOutPath</key><string>$STATE/collect.log</string>
+  <key>StandardErrorPath</key><string>$STATE/collect.log</string>
+</dict>
+</plist>
+EOF
+  launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+  if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then
+    echo "collecting every day at $at; you'll get a phone notification when there's something to review"
+  else
+    echo "wrote $PLIST, but launchd wouldn't load it; run: launchctl bootstrap gui/$(id -u) $PLIST" >&2
+    return 1
+  fi
+  [ -s "$ROUTES" ] || echo "  nothing is routed yet: gw feed channel add <name>, then gw feed route <owner/repo> <name>"
+}
+cmd_off() {
+  launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+  if [ -f "$PLIST" ]; then rm -f "$PLIST"; echo "stopped the daily collect"; else echo "no daily collect was set up"; fi
+}
+cmd_status() {
+  local at
+  echo "channels:"
+  if [ -s "$CHANNELS" ]; then
+    # The URL is a credential; show only enough to tell two apart.
+    awk -F '\t' '{ print "  #" $1 "  " substr($2, 1, 34) "…" }' "$CHANNELS"
+  else echo "  none (gw feed channel add <name>)"; fi
+  echo "routes:"
+  if [ -s "$ROUTES" ]; then awk -F '\t' '{ print "  " $1 " -> #" $2 }' "$ROUTES"
+  else echo "  none (gw feed route <owner/repo> <channel>)"; fi
+  if [ -f "$PLIST" ]; then
+    at="$(sed -n 's#.*<key>Hour</key><integer>\([0-9]*\)</integer><key>Minute</key><integer>\([0-9]*\)</integer>.*#\1:\2#p' "$PLIST" \
+      | awk -F: '{ printf "%02d:%02d", $1, $2 }')"
+    echo "daily collect: at ${at:-?}"
+  else echo "daily collect: off (gw feed setup)"; fi
+  echo "waiting for review: $(_queued)"
+  [ -s "$LAST" ] && echo "last collect: $(cat "$LAST")"
+  return 0
+}
+
+case "${1:-}" in
+  review)  shift; cmd_review "$@" ;;
+  collect) shift; cmd_collect "$@" ;;
+  channel|channels) shift; cmd_channel "$@" ;;
+  route|routes) shift; cmd_route "$@" ;;
+  setup)   shift; cmd_setup "$@" ;;
+  status)  shift; cmd_status "$@" ;;
+  off)     shift; cmd_off "$@" ;;
+  help|-h|--help) usage ;;
+  # Anything else is the listing: gw feed, gw feed -f, gw feed yesterday -g.
+  *) exec "$ROOT/bin/gp-pr" latest "$@" ;;
+esac

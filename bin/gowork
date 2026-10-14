@@ -30,7 +30,6 @@ Usage: gw <command> [args...]      (anything else goes to git: gw pull, gw log)
 Git and pull requests:
   pr          pull requests: list, checkout, merge, close, unmerge
   pl          = gw pr list            pm   = gw pr merge
-  pll         = gw pr latest: your last merged/closed PRs (-50 for 50; -f to follow)
   new         create a branch and switch to it
   switch      everything git switch does, plus worktree/PR-aware resolution
   sync        rebase branches onto their base
@@ -40,6 +39,9 @@ Git and pull requests:
   wsweep      delete worktrees whose branches are gone
   haspr       check whether a branch has an open PR
   release     tag and publish a GitHub release
+  feed        your latest merged/closed PRs (-50 for 50; -f to follow, -g everywhere)
+  feed review|collect|setup        approve them as a Slack update, collected daily
+  feed channel|route|status|off    Slack webhooks, and which repo goes where
 
 Identity (which GitHub account, SSH key and AWS profile a directory uses):
   account setup|status|off        gh/aws shims, git routing, Claude sandbox
@@ -89,7 +91,7 @@ case "$cmd" in
   help|--help|-h) usage ;;
   version|--version|-v) version ;;
 
-  pr|pl|pll|pm|new|switch|sync|fork|done|sweep|wsweep|haspr|release)
+  pr|pl|pm|new|switch|sync|fork|done|sweep|wsweep|haspr|release)
     exec "$BIN_DIR/gp" "$cmd" "$@" ;;
 
   account)
@@ -115,6 +117,7 @@ case "$cmd" in
   sleep)   exec "$BIN_DIR/rigor" sleep "$@" ;;
   migrate) exec "$ROOT/libexec/gowork-migrate" "$@" ;;
   browser) exec "$ROOT/libexec/gowork-browser" "$@" ;;
+  feed)    exec "$ROOT/libexec/gowork-feed" "$@" ;;
 
   *)
     if git help "$cmd" >/dev/null 2>&1; then

@@ -132,50 +132,50 @@ EOF2
 chmod +x "$FAKE/gh"
 PRREPO="$TMP/prrepo"; git init -q "$PRREPO"
 pl() { (cd "$PRREPO" && TZ=America/Los_Angeles PATH="$FAKE:$PATH" "$GW" "$@" 2>&1); }
-out="$(pl pll)"
+out="$(pl feed)"
 # #7 merged 02:30 UTC on the 6th, which is the evening of the 5th in
 # California: the time shown is local, and so is the day.
-check "pll lists merged and closed PRs, oldest first, tagged, in local American time" "$out" "u/10 -- ten [CLOSED] (Oct 1, 2026, 9:00 AM)
+check "feed lists merged and closed PRs, oldest first, tagged, in local American time" "$out" "u/10 -- ten [CLOSED] (Oct 1, 2026, 9:00 AM)
 u/8 -- eight [MERGED] (Oct 2, 2026, 11:00 AM)
 u/9 -- nine [MERGED] (Oct 3, 2026, 1:15 PM)
 u/7 -- seven [MERGED] (Oct 5, 2026, 7:30 PM)"
-check "GOWORK_TIME_FORMAT=eu shows day first, 24-hour" "$(GOWORK_TIME_FORMAT=eu pl pll -1)" "u/7 -- seven [MERGED] (5 Oct 2026, 19:30)"
+check "GOWORK_TIME_FORMAT=eu shows day first, 24-hour" "$(GOWORK_TIME_FORMAT=eu pl feed -1)" "u/7 -- seven [MERGED] (5 Oct 2026, 19:30)"
 git config --global gowork.timeFormat iso
-check "gowork.timeFormat=iso shows ISO" "$(pl pll -1)" "u/7 -- seven [MERGED] (2026-10-05 19:30)"
+check "gowork.timeFormat=iso shows ISO" "$(pl feed -1)" "u/7 -- seven [MERGED] (2026-10-05 19:30)"
 git config --global --unset gowork.timeFormat
-out="$(GOWORK_TIME_FORMAT=uk pl pll)"; rc=$?
+out="$(GOWORK_TIME_FORMAT=uk pl feed)"; rc=$?
 check "an unknown time format is refused" "$rc" "2"
-check "pl latest is the same" "$(pl pl latest)" "$(pl pll)"
-check "pll -2 shows the latest two, oldest first" "$(pl pll -2 -nt)" "u/9 [MERGED]
+check "pl latest is the same" "$(pl pl latest)" "$(pl feed)"
+check "feed -2 shows the latest two, oldest first" "$(pl feed -2 -nt)" "u/9 [MERGED]
 u/7 [MERGED]"
-check "pll -x drops a PR before counting" "$(pl pll -2 -nt -x 7)" "u/8 [MERGED]
+check "feed -x drops a PR before counting" "$(pl feed -2 -nt -x 7)" "u/8 [MERGED]
 u/9 [MERGED]"
-rm -f "$TMP/gh-calls"; pl pll -30 >/dev/null
-saw "pll asks for closed PRs (merged ones included) by update time" "$(cat "$TMP/gh-calls")" "--state closed --search sort:updated-desc --limit 60"
-rm -f "$TMP/gh-calls"; out="$(pl pll -e -2)"
-check "pll -e shows anyone's, with the author" "$out" "u/9 -- nine [MERGED] (Oct 3, 2026, 1:15 PM, by me)
+rm -f "$TMP/gh-calls"; pl feed -30 >/dev/null
+saw "feed asks for closed PRs (merged ones included) by update time" "$(cat "$TMP/gh-calls")" "--state closed --search sort:updated-desc --limit 60"
+rm -f "$TMP/gh-calls"; out="$(pl feed -e -2)"
+check "feed -e shows anyone's, with the author" "$out" "u/9 -- nine [MERGED] (Oct 3, 2026, 1:15 PM, by me)
 u/7 -- seven [MERGED] (Oct 5, 2026, 7:30 PM, by ana)"
 check "...because it doesn't ask for yours alone" "$(grep -c -- '--author' "$TMP/gh-calls")" "0"
-out="$(pl pll -g -e)"; rc=$?
-check "pll -g -e is refused" "$rc" "2"
+out="$(pl feed -g -e)"; rc=$?
+check "feed -g -e is refused" "$rc" "2"
 out="$(pl pl -f)"; rc=$?
 check "-f goes with latest only" "$rc" "2"
-out="$(pl pll -f -c)"; rc=$?
-check "pll -f -c is refused" "$rc" "2"
-out="$(pl pll -f 10/1..10/5)"; rc=$?
-check "pll -f with a window that ends is refused" "$rc" "2"
+out="$(pl feed -f -c)"; rc=$?
+check "feed -f -c is refused" "$rc" "2"
+out="$(pl feed -f 10/1..10/5)"; rc=$?
+check "feed -f with a window that ends is refused" "$rc" "2"
 # -f: the latest, then each PR that closes afterwards, once, though every
 # check returns it again. exec, so the signal reaches gp-pr itself.
 rm -f "$TMP/gh-calls"
 (cd "$PRREPO" && TZ=America/Los_Angeles PATH="$FAKE:$PATH" GOWORK_FOLLOW_INTERVAL=0.2 \
-  exec "$GW" pll -f -nt -2 >"$TMP/follow.out" 2>"$TMP/follow.err") & fpid=$!
+  exec "$GW" feed -f -nt -2 >"$TMP/follow.out" 2>"$TMP/follow.err") & fpid=$!
 sleep 2; kill "$fpid" 2>/dev/null; wait "$fpid"; rc=$?
-check "pll -f lists the latest, then each PR as it closes, once" "$(cat "$TMP/follow.out")" "u/9 [MERGED]
+check "feed -f lists the latest, then each PR as it closes, once" "$(cat "$TMP/follow.out")" "u/9 [MERGED]
 u/7 [MERGED]
 u/13 [MERGED]"
-check "pll -f stops cleanly on a signal" "$rc" "0"
-saw "pll -f says it's watching" "$(cat "$TMP/follow.err")" "watching for PRs that merge or close"
-saw "pll -f asks what closed lately" "$(cat "$TMP/gh-calls")" "--search closed:>="
+check "feed -f stops cleanly on a signal" "$rc" "0"
+saw "feed -f says it's watching" "$(cat "$TMP/follow.err")" "watching for PRs that merge or close"
+saw "feed -f asks what closed lately" "$(cat "$TMP/gh-calls")" "--search closed:>="
 rm -f "$TMP/gh-calls"; out="$(pl pl -5)"
 check "pl lists open PRs with when each was opened, in local time" "$out" "u/11 -- eleven (opened Oct 6, 2026, 4:40 PM)
 u/12 -- twelve (opened Oct 7, 2026, 9:05 AM)"
@@ -184,40 +184,40 @@ u/12"
 saw "pl -5 limits the open listing" "$(cat "$TMP/gh-calls")" "--state open --limit 5"
 # A date argument becomes GitHub's closed: qualifier, in local time with its
 # offset, so GitHub does the filtering. With a date there is no default cap.
-rm -f "$TMP/gh-calls"; pl pll 2026-10-05 >/dev/null
-saw "pll <date> asks GitHub for PRs closed since that local midnight" "$(cat "$TMP/gh-calls")" \
+rm -f "$TMP/gh-calls"; pl feed 2026-10-05 >/dev/null
+saw "feed <date> asks GitHub for PRs closed since that local midnight" "$(cat "$TMP/gh-calls")" \
   "--search closed:>=2026-10-05T00:00:00-07:00 sort:updated-desc --limit 1000"
-rm -f "$TMP/gh-calls"; pl pll 2026-10-05 14:30 -5 >/dev/null
-saw "pll <date> <time>, as two words, is one point; -N still caps" "$(cat "$TMP/gh-calls")" \
+rm -f "$TMP/gh-calls"; pl feed 2026-10-05 14:30 -5 >/dev/null
+saw "feed <date> <time>, as two words, is one point; -N still caps" "$(cat "$TMP/gh-calls")" \
   "--search closed:>=2026-10-05T14:30:00-07:00 sort:updated-desc --limit 20"
 rm -f "$TMP/gh-calls"; pl pl latest 2026-10-01..2026-10-05 >/dev/null
 saw "a window's end date runs to the end of that day" "$(cat "$TMP/gh-calls")" \
   "closed:2026-10-01T00:00:00-07:00..2026-10-05T23:59:59-07:00"
-rm -f "$TMP/gh-calls"; pl pll ..2026-12-01T09:00 >/dev/null
+rm -f "$TMP/gh-calls"; pl feed ..2026-12-01T09:00 >/dev/null
 saw "..<when> means up to then (standard time in December)" "$(cat "$TMP/gh-calls")" \
   "closed:<=2026-12-01T09:00:00-08:00"
-out="$(pl pll 3)"; rc=$?
-check "pll takes no ids" "$rc" "2"
+out="$(pl feed 3)"; rc=$?
+check "feed takes no ids" "$rc" "2"
 saw "...and says what it does take" "$out" "isn't a date or time"
-out="$(pl pll 2026-02-31)"; rc=$?
-check "pll refuses a date that doesn't exist" "$rc" "2"
-rm -f "$TMP/gh-calls"; pl pll 10/5/2026 2:30pm..10/6/26 9am >/dev/null
+out="$(pl feed 2026-02-31)"; rc=$?
+check "feed refuses a date that doesn't exist" "$rc" "2"
+rm -f "$TMP/gh-calls"; pl feed 10/5/2026 2:30pm..10/6/26 9am >/dev/null
 saw "American dates and 12-hour times" "$(cat "$TMP/gh-calls")" \
   "closed:2026-10-05T14:30:00-07:00..2026-10-06T09:00:00-07:00"
-rm -f "$TMP/gh-calls"; GOWORK_TIME_FORMAT=eu pl pll 5/10/2026..6/10/2026 >/dev/null
+rm -f "$TMP/gh-calls"; GOWORK_TIME_FORMAT=eu pl feed 5/10/2026..6/10/2026 >/dev/null
 saw "eu reads a slashed date day first" "$(cat "$TMP/gh-calls")" \
   "closed:2026-10-05T00:00:00-07:00..2026-10-06T23:59:59-07:00"
-rm -f "$TMP/gh-calls"; pl pll 12am..12pm >/dev/null
+rm -f "$TMP/gh-calls"; pl feed 12am..12pm >/dev/null
 saw "12am is midnight..." "$(cat "$TMP/gh-calls")" "T00:00:00-0"
 saw "...and 12pm is noon" "$(cat "$TMP/gh-calls")" "T12:00:00-0"
 for bad in 13/5 13pm 0am 9:60 10/5/123; do
-  out="$(pl pll "$bad")"; rc=$?
-  check "pll refuses '$bad'" "$rc" "2"
+  out="$(pl feed "$bad")"; rc=$?
+  check "feed refuses '$bad'" "$rc" "2"
 done
 out="$(pl pm 3 -5)"; rc=$?
 check "a count doesn't apply to merge" "$rc" "2"
-out="$(pl pll -0)"; rc=$?
-check "pll -0 is refused" "$rc" "2"
+out="$(pl feed -0)"; rc=$?
+check "feed -0 is refused" "$rc" "2"
 rm -f "$FAKE/gh"
 
 echo "== migrate =="

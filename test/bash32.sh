@@ -108,6 +108,19 @@ check() {  # check <command> [args...]
   esac
 }
 
+checkfeed() {  # checkfeed [args...]: gw feed's own script, under bash 3.2
+  local name="feed $*" out
+  out="$(printf q | PATH="$FB:$PATH" GOWORK_FEED_TTY=any GOWORK_FEED_PLIST="$TMP/feed.plist" \
+    GOWORK_FEED_CONF="$TMP/feed-conf" GOWORK_FEED_STATE="$TMP/feed-state" \
+    "$BASH32" "$BIN/../libexec/gowork-feed" "$@" 2>&1)"
+  case "$out" in
+    *"unbound variable"*)
+      fail=$((fail + 1))
+      printf '  FAIL %s\n       %s\n' "$name" "$(printf '%s' "$out" | grep 'unbound variable' | head -1)" ;;
+    *) pass=$((pass + 1)); printf '  ok   %s\n' "$name" ;;
+  esac
+}
+
 echo "== every command under $("$BASH32" --version | head -1 | sed 's/GNU bash, //') =="
 # Deliberately includes the no-argument and single-argument forms: the bug
 # class shows up precisely when an optional array (excludes, targets, skipped,
@@ -126,6 +139,8 @@ check pr -3
 check pr latest
 check pr latest -5 -x 6
 check pr latest 2026-10-01..2026-10-05
+check pr latest --raw
+check pr latest -g --raw 2d
 check pr 5
 check sync -n
 check sync 5 -n
@@ -140,6 +155,12 @@ check new tmpbranch
 check wsweep -n
 check account list
 check account check
+checkfeed status
+checkfeed review
+checkfeed collect
+checkfeed review
+checkfeed route rm x/y
+checkfeed channel rm nothing
 
 echo
 echo "$pass passed, $fail failed"

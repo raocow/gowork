@@ -39,7 +39,10 @@ names for that reason.
 
 | Command | What it does | Was |
 |---|---|---|
-| `gw pr`, `gw pl`, `gw pll`, `gw pm` | pull requests: list, check out, merge, close, unmerge; `pll` lists your last merged or closed PRs, tagged `[MERGED]` or `[CLOSED]` (`gw pll -50`), or those finished since a time (`gw pll yesterday`, `gw pll 10/1..10/5`); `gw pll -f` stays open and adds each as it merges or closes, `-e` shows everyone's, `-g` yours everywhere; times are American unless `GOWORK_TIME_FORMAT` or `gowork.timeFormat` is `eu` or `iso` | `gp pr`, `gp pl`, `gp pll`, `gp pm` |
+| `gw pr`, `gw pl`, `gw pm` | pull requests: list, check out, merge, close, unmerge | `gp pr`, `gp pl`, `gp pm` |
+| `gw feed` | your last merged or closed PRs, tagged `[MERGED]` or `[CLOSED]` (`gw feed -50`), or those finished since a time (`gw feed yesterday`, `gw feed 10/1..10/5`); `-f` stays open and adds each as it merges or closes, `-e` shows everyone's, `-g` yours everywhere; times are American unless `GOWORK_TIME_FORMAT` or `gowork.timeFormat` is `eu` or `iso` | `gp pr latest` |
+| `gw feed review\|collect\|setup` | your merges as a Slack update: collected daily, approved, withheld or reworded one by one in a terminal UI, then posted as one digest per channel | — |
+| `gw feed channel\|route\|status\|off` | Slack incoming webhooks, and which repo (or `owner/*`) posts to which; unrouted repos are never posted | — |
 | `gw new`, `switch`, `sync`, `done`, `sweep`, `wsweep`, `haspr`, `release` | branch and worktree workflow | `gp …` |
 | `gw fork sync\|status\|pr` | forks: catch the base up with upstream, compare with it, open a PR to it | — |
 | `gw account setup\|status\|off` | gh/aws shims, git routing, Claude sandbox wiring | `rigor identity …` |

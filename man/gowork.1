@@ -29,19 +29,13 @@ is
 gowork's own commands avoid git's names for that reason.
 .SH COMMANDS
 .TP
-.BR pr ", " pl ", " pll ", " pm
+.BR pr ", " pl ", " pm
 Pull requests: list, check out, merge, close, unmerge.
-.BR pl ,
-.B pll
+.B pl
 and
 .B pm
 are short for
-.BR "pr list" ,
-.B pr latest
-(your most recently merged or closed PRs; add
-.BI - N
-for how many, as in
-.BR "gw pll -50" )
+.B pr list
 and
 .BR "pr merge" .
 See
@@ -90,6 +84,57 @@ Open GitHub links in the Chrome profile signed in to the right account, via
 Finicky as the default browser, with rules generated from the accounts and
 their bindings.
 .TP
+.BR feed " [" \fIwhen\fR "] [" \-f "] [" \-e "] [" \-g "] [" \-\fIN\fR ]
+Your latest merged and closed PRs, oldest first, each tagged
+.B [MERGED]
+or
+.BR [CLOSED] ;
+the listing is
+.B gp pr latest
+(see
+.BR gp-pr (1)).
+.B \-f
+stays open and adds each PR as it merges or closes,
+.B \-e
+shows everyone's in the repository,
+.B \-g
+yours in every repository and account.
+.TP
+.B feed review
+Go through the updates waiting to be posted to Slack. Each starts kept; space
+withholds it (or keeps it again),
+.B e
+rewords it in
+.BR $EDITOR ,
+.B p
+posts one digest per channel after asking, and
+.B q
+leaves them all queued. A withheld update is remembered and never comes back.
+.TP
+.BR "feed collect" " [" \-\-quiet ]
+Queue the PRs you've merged, in any repository and under any
+.B gh
+account, since the last collect (a day back the first time), and send a phone
+notification through
+.B gw notify
+when there's something new. Only repositories with a route are queued.
+.TP
+.BR "feed channel add" " \fIname\fR [\fIwebhook-url\fR] | " "feed channel rm" " \fIname"
+A Slack channel to post to, by its incoming webhook. Without the URL it's
+read from standard input, which keeps it out of shell history.
+.TP
+.BR "feed route" " \fIowner/repo\fR|\fIowner/*\fR \fIchannel\fR | " "feed route rm" " \fIpattern"
+Post that repository's updates, or a whole owner's, to that channel. An exact
+repository beats its owner's route.
+.TP
+.BR "feed setup" " [" \-\-at " \fIHH:MM\fR] | " "feed status" " | " "feed off"
+Run
+.B feed collect
+every day at that time (17:00) with launchd; show channels, routes, schedule
+and what's waiting; stop the daily run.
+.B git config \-\-global gowork.feedHeading
+sets the digest's first line, which is otherwise your name.
+.TP
 .BR migrate " [" \-\-dry\-run ]
 Point an existing rigor/gitplus setup at gowork: rc-file source lines and
 completion path, Claude Code hooks, Codex's notify program, identity shims,
@@ -104,6 +149,14 @@ Configuration, kept under its original name.
 .TP
 .I ~/.local/share/rigor/identity/bin/
 The gh and aws shims.
+.TP
+.I ~/.config/rigor/feed/
+.B gw feed
+channels (webhook URLs, mode 600) and routes.
+.TP
+.I ~/.local/share/rigor/feed/
+.B gw feed
+queue, decisions, and the daily collect's log.
 .SH SEE ALSO
 .BR gp-pr (1),
 .BR gp-account (1),
